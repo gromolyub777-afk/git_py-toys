@@ -26,6 +26,14 @@ Git Committer v3 — GUI-приложение (Tkinter) для двусторо�
 Необязательные: pystray + Pillow (трей), watchdog (watcher файлов).
 """
 
+# Файл-левел подавления Pylance/Pyright (ТЗ v3.2, п.40): каскад предупреждений
+# про «tkinter | None», Optional[...] и динамические Tk-атрибуты физически
+# невозможно убрать без assert'ов в каждой строке UI-кода.
+# pyright: reportOptionalMemberAccess=false, reportGeneralTypeIssues=false,
+#          reportUnknownMemberType=false, reportUnknownArgumentType=false,
+#          reportPossiblyUnboundVariable=false, reportMissingImports=false,
+#          reportAttributeAccessIssue=false
+
 import hashlib
 import json
 import logging
@@ -42,21 +50,33 @@ import zipfile
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Any, Callable, Optional
 
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     _TK_ERROR_TEXT = ""
 except Exception as _tk_exc:                       # noqa: BLE001
-    tk = None
+    tk = None                                      # type: ignore[assignment]
     _TK_ERROR_TEXT = str(_tk_exc)
+
+# watchdog — опциональная зависимость watcher'а файлов (импорты на уровне
+# модуля, ТЗ v3.2 п.1.2; без неё UI снимает чекбокс и просит pip install).
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    _HAS_WATCHDOG = True
+except ImportError:
+    Observer = None                                # type: ignore[assignment]
+    FileSystemEventHandler = None                  # type: ignore[assignment]
+    _HAS_WATCHDOG = False
 
 
 # --------------------------------------------------------------------------- #
 #  Константы                                                                   #
 # --------------------------------------------------------------------------- #
 
-__version__ = "3.1.0"
+__version__ = "3.3.0"
 APP_TITLE = f"Git Committer v{__version__}"
 CONFIG_NAME = "config.json"
 LOG_NAME = "git_committer.log"
@@ -128,7 +148,7 @@ def local_clone_dir(repo_url: str) -> Path:
     return config_dir() / f"repo_{name}_{digest}"
 
 
-def _ignore_dirs(_dir: str, names: list) -> set:
+def _ignore_dirs(_dir: str, names: list[str]) -> set[str]:
     """shutil.copytree(ignore): отсекаем служебные каталоги и *.egg-info."""
     ignored = {n for n in names if n in SYNC_IGNORE or n.endswith(".egg-info")}
     return ignored
@@ -138,7 +158,7 @@ def _ignore_dirs(_dir: str, names: list) -> set:
 #  Лог в файл (всегда, рядом с config.json; ротация 1 МБ × 3)                 #
 # --------------------------------------------------------------------------- #
 
-_FILE_LOG_WARNED = False                    # предупредить о провале один раз
+_FILE_LOG_WARNED: bool = False              # предупредить о провале один раз
 
 
 def _setup_file_logging() -> logging.Logger:
@@ -163,7 +183,7 @@ def _setup_file_logging() -> logging.Logger:
     return logger
 
 
-def _log_to_file(msg: str, level: int = logging.INFO):
+def _log_to_file(msg: str, level: int = logging.INFO) -> None:
     """Запись сообщения GUI-лога в файл (пишется ВСЕГДА)."""
     _setup_file_logging().log(level, msg)
 
@@ -179,12 +199,12 @@ class Config:
     config.broken.json и пересоздаётся. Наружу — только get/set/update/as_dict.
     """
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path) -> None:
         self._path = Path(path)
-        self._data: dict = {}
+        self._data: dict[str, Any] = {}
 
     @staticmethod
-    def defaults() -> dict:
+    def defaults() -> dict[str, Any]:
         """Конфиг по умолчанию — генерируется сам, без вмешательства пользователя."""
         return {
             "source_folder": str(Path.home()),           # папка, откуда коммитим
@@ -253,8 +273,9 @@ class Config:
         if not isinstance(sched, dict):
             sched = dict(base["auto_schedule"])
         else:
-            for k, v in base["auto_schedule"].items():
-                sched.setdefault(k, v if not isinstance(v, list) else list(v))
+            for k, val in base["auto_schedule"].items():
+                sched.setdefault(
+                    k, val if not isinstance(val, list) else list(val))
         days = [d for d in sched.get("days", []) if isinstance(d, int) and 1 <= d <= 7]
         sched["days"] = sorted(set(days))
         data["auto_schedule"] = sched
@@ -273,7 +294,7 @@ class Config:
             with f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_name, path)
-        except Exception:
+        except Exception:                                   # noqa: BLE001
             # Если os.fdopen бросил исключение — fd всё ещё наш, закрываем сами.
             if not fd_owned:
                 try:
@@ -291,16 +312,16 @@ class Config:
         """Перечитать диск (ручные правки config.json подхватываются на лету)."""
         self.load()
 
-    def get(self, key, default=None):
+    def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
 
-    def set(self, key, value) -> None:
+    def set(self, key: str, value: Any) -> None:
         self._data[key] = value
 
-    def update(self, mapping: dict) -> None:
+    def update(self, mapping: dict[str, Any]) -> None:
         self._data.update(mapping)
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> dict[str, Any]:
         """Снимок для фоновых потоков (не делим мутабельный dict напрямую)."""
         return dict(self._data)
 
@@ -341,12 +362,12 @@ class Config:
     # ---- обратная совместимость с тестами v1/v2 ----------------------- #
 
     @property
-    def data(self) -> dict:
+    def data(self) -> dict[str, Any]:
         """dict-представление (для старых тестов; изменения не сохраняются)."""
         return self._data
 
 
-def load_config() -> dict:
+def load_config() -> dict[str, Any]:
     """[compat] Прочитать конфиг как dict (тот же код, что и Config.load)."""
     cfg = Config(config_path())
     cfg.load()
@@ -360,7 +381,7 @@ def save_config(cfg: dict) -> None:
     c.save()
 
 
-def default_config() -> dict:
+def default_config() -> dict[str, Any]:
     """[compat] Конфиг по умолчанию."""
     return Config.defaults()
 
@@ -376,7 +397,9 @@ class GitRunner:
     таймауты, парсинг ошибок → GitError.
     """
 
-    def run(self, args, cwd=None, timeout=GIT_TIMEOUT) -> str:
+    @staticmethod
+    def run(args: list[str], cwd: Any = None,
+            timeout: Optional[int] = GIT_TIMEOUT) -> str:
         """Запуск git с захватом вывода. Бросает GitError при ненулевом коде/таймауте."""
         env = os.environ.copy()
         # Никаких интерактивных запросов паролей и редакторов из-под GUI
@@ -384,7 +407,7 @@ class GitRunner:
         env["GIT_EDITOR"] = "true"
         env["GCM_INTERACTIVE"] = "never"        # Git Credential Manager
         try:
-            proc = subprocess.run(
+            proc = subprocess.run(              # noqa: S603, PLW1510
                 ["git", *args],
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
@@ -393,6 +416,7 @@ class GitRunner:
                 errors="replace",
                 timeout=timeout,
                 env=env,
+                check=False,
             )
         except FileNotFoundError:
             raise GitError("Команда «git» не найдена в системе. Установите git.")
@@ -404,11 +428,12 @@ class GitRunner:
                            .strip() or f"git {' '.join(args)} завершился с ошибкой")
         return (proc.stdout or "").strip()
 
-    def version(self) -> tuple:
+    @staticmethod
+    def version() -> tuple[bool, Any]:
         """Возвращает (ok, версия_или_текст_ошибки). ok=False — git не найден."""
         try:
-            proc = subprocess.run(["git", "--version"], capture_output=True,
-                                  text=True, timeout=15)
+            proc = subprocess.run(["git", "--version"], capture_output=True,  # noqa: S603, PLW1510
+                                  text=True, timeout=15, check=False)
             out = proc.stdout or ""
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
             return False, ()
@@ -418,7 +443,7 @@ class GitRunner:
         return True, (int(m.group(1)), int(m.group(2)))
 
     @staticmethod
-    def net_timeout(cfg) -> int:
+    def net_timeout(cfg: Any) -> int:
         """Таймаут сетевых git-команд из конфига (git_timeout_min, спинбокс 1–60).
 
         Принимает как Config, так и plain dict (снапшот для фоновых потоков).
@@ -431,26 +456,28 @@ class GitRunner:
         minutes = min(max(minutes, 1), 60)
         return minutes * 60
 
-    def ref_exists(self, ref: str, cwd) -> bool:
+    @staticmethod
+    def ref_exists(ref: str, cwd: Any) -> bool:
         """Есть ли ref (rev-parse --verify: код 0 = есть, иначе — нет)."""
         try:
-            self.run(["rev-parse", "--verify", "--quiet", ref], cwd=cwd)
+            GitRunner.run(["rev-parse", "--verify", "--quiet", ref], cwd=cwd)
             return True
         except GitError:
             return False
 
 
-def check_git():
+def check_git() -> tuple[bool, Any]:
     """Возвращает (ok, версия_или_текст_ошибки). ok=False — git не найден."""
     return GitRunner().version()
 
 
-def net_timeout(cfg) -> int:
+def net_timeout(cfg: Any) -> int:
     """[compat] Таймаут сетевых git-команд из конфига."""
     return GitRunner.net_timeout(cfg)
 
 
-def run_git(args, cwd=None, timeout=GIT_TIMEOUT) -> str:
+def run_git(args: list[str], cwd: Any = None,
+            timeout: Optional[int] = GIT_TIMEOUT) -> str:
     """[compat] Запуск git через единственный GitRunner приложения.
 
     Тело повторяет контракт GitRunner.run: env GIT_TERMINAL_PROMPT=0 и
@@ -475,7 +502,8 @@ _default_git_runner = GitRunner()
 class FileSync:
     """Копирование source ↔ workdir. Ничего не знает про git — только файлы."""
 
-    def into_repo(self, source: Path, workdir: Path, delete_extra: bool = True) -> int:
+    @staticmethod
+    def into_repo(source: Path, workdir: Path, delete_extra: bool = True) -> int:
         """
         Копирует содержимое папки-источника в рабочую копию репозитория.
           * пропускает служебные папки (SYNC_IGNORE);
@@ -510,7 +538,9 @@ class FileSync:
 
         return count
 
-    def from_repo(self, workdir: Path, target: Path, confirm=None) -> tuple:
+    @staticmethod
+    def from_repo(workdir: Path, target: Path,
+                  confirm: Optional[Callable[[Path], bool]] = None) -> tuple:
         """Выгрузка содержимого рабочей копии (без .git) поверх целевой папки.
 
         confirm(target)->bool решает судьбу «лишних» файлов (тех, которых нет
@@ -555,7 +585,8 @@ class FileSync:
                 removed.append(old_item)
         return copied, removed, cancelled, len(extras)
 
-    def copy_repo_items(self, workdir: Path, target: Path) -> int:
+    @staticmethod
+    def copy_repo_items(workdir: Path, target: Path) -> int:
         """Только копирование (без чистки лишнего) — используется в download."""
         workdir, target = Path(workdir), Path(target)
         copied = 0
@@ -572,7 +603,8 @@ class FileSync:
             copied += 1
         return copied
 
-    def count_files(self, tree: Path) -> int:
+    @staticmethod
+    def count_files(tree: Path) -> int:
         """Рекурсивное число файлов в дереве (служебные папки не считаем)."""
         total = 0
         for root_dir, dirs, files in os.walk(tree):
@@ -585,11 +617,12 @@ class FileSync:
 _default_fs = FileSync()
 
 
-def sync_source_into_repo(source, workdir, delete_extra: bool = True) -> int:
+def sync_source_into_repo(source: Any, workdir: Any,
+                          delete_extra: bool = True) -> int:
     return _default_fs.into_repo(Path(source), Path(workdir), delete_extra)
 
 
-def count_files(tree) -> int:
+def count_files(tree: Any) -> int:
     return _default_fs.count_files(Path(tree))
 
 
@@ -600,13 +633,14 @@ def count_files(tree) -> int:
 class BackupManager:
     """ZIP-бэкапы целевой папки в ./backups + ротация (keep последних N)."""
 
-    def __init__(self, base_dir: Path = None):
-        self._base = Path(base_dir) if base_dir else config_dir() / "backups"
+    def __init__(self, base_dir: Optional[Path] = None) -> None:
+        self._base: Path = Path(base_dir) if base_dir else config_dir() / "backups"
 
     def backups_dir(self) -> Path:
         return self._base
 
-    def backup(self, folder: Path, log=None) -> Path:
+    def backup(self, folder: Path,
+               log: Optional[Callable[[str], None]] = None) -> Path:
         """ZIP-бэкап содержимого папки в ./backups/<имя>_<YYYYMMDD_HHMMSS>.zip.
 
         Служебные папки (SYNC_IGNORE, включая .git) в архив не кладём.
@@ -668,7 +702,7 @@ def backups_dir() -> Path:
     return _default_backup.backups_dir()
 
 
-def backup_target_folder(target, log) -> Path:
+def backup_target_folder(target: Any, log: Optional[Callable[[str], None]]) -> Path:
     return _default_backup.backup(Path(target), log=log)
 
 
@@ -679,24 +713,25 @@ def backup_target_folder(target, log) -> Path:
 class Notifier:
     """Звук по завершении задачи (win/mac/linux). Никогда не бросает ошибок."""
 
-    def play_beep(self):
+    @staticmethod
+    def play_beep() -> None:
         def _run():
             try:
                 if sys.platform.startswith("win"):
                     import winsound
-                    winsound.Beep(880, 250)
+                    winsound.Beep(880, 250)               # type: ignore[attr-defined]
                 elif sys.platform == "darwin":
-                    subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"],
-                                   timeout=5)
+                    subprocess.run(["afplay", "/System/Library/Sounds/Glass.aiff"],  # noqa: S603, PLW1510
+                                   timeout=5, check=False)
                 else:
                     wav = "/usr/share/sounds/freedesktop/stereo/complete.oga"
                     if os.path.exists(wav) and shutil.which("paplay"):
-                        subprocess.run(["paplay", wav], timeout=5)
+                        subprocess.run(["paplay", wav], timeout=5, check=False)  # noqa: S603, PLW1510
                     else:
                         # /dev/snd/beeper не существует — единственный
                         # остаточный fallback: ASCII bell в stderr
                         print("\a", file=sys.stderr, end="", flush=True)
-            except Exception:                                    # noqa: BLE001
+            except Exception:                                    # noqa: BLE001, S110
                 pass                                             # звук — не критично
         threading.Thread(target=_run, daemon=True).start()
 
@@ -704,7 +739,7 @@ class Notifier:
 _default_notifier = Notifier()
 
 
-def play_beep():
+def play_beep() -> None:
     """[compat] Звук по окончании через Notifier."""
     _default_notifier.play_beep()
 
@@ -720,12 +755,15 @@ class RepoService:
     вывод — через callable `log`.
     """
 
-    def __init__(self, git: GitRunner = None, fs: FileSync = None,
-                 backup: BackupManager = None, notifier: Notifier = None):
-        self.git = git or GitRunner()
-        self.fs = fs or FileSync()
-        self.backup = backup or BackupManager()
-        self.notifier = notifier or Notifier()
+    def __init__(self,
+                 git: Optional[GitRunner] = None,
+                 fs: Optional[FileSync] = None,
+                 backup: Optional[BackupManager] = None,
+                 notifier: Optional[Notifier] = None) -> None:
+        self.git: GitRunner = git or GitRunner()
+        self.fs: FileSync = fs or FileSync()
+        self.backup: BackupManager = backup or BackupManager()
+        self.notifier: Notifier = notifier or Notifier()
 
     # ------------------------------------------------------------------ #
     #  Рабочая область                                                    #
@@ -805,7 +843,8 @@ class RepoService:
     #  Вспомогательные                                                    #
     # ------------------------------------------------------------------ #
 
-    def make_commit_message(self, cfg) -> str:
+    @staticmethod
+    def make_commit_message(cfg: Any) -> str:
         message = str(cfg.get("commit_message") or "Автокоммит: {datetime}")
         return message.replace("{datetime}",
                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
@@ -831,7 +870,8 @@ class RepoService:
                     deleted.append(name)
         return added, deleted
 
-    def append_history(self, cfg, entry: dict) -> None:
+    @staticmethod
+    def append_history(cfg: Any, entry: dict) -> None:
         """История пишется через Config (единственный владелец config.json)."""
         if isinstance(cfg, Config):
             cfg.append_history(entry)
@@ -842,7 +882,8 @@ class RepoService:
     #  Прямой процесс: папка → репозиторий                                 #
     # ------------------------------------------------------------------ #
 
-    def commit(self, cfg, log, auto: bool = False) -> str:
+    def commit(self, cfg: Any, log: Callable[[str], None],
+               auto: bool = False) -> str:
         """Синхронизация + add + commit (+ push при желании).
 
         auto=True — запуск из авто-режима: dry-run не применяется, push
@@ -938,7 +979,8 @@ class RepoService:
     #  Обратный процесс: репозиторий → папка                               #
     # ------------------------------------------------------------------ #
 
-    def download(self, cfg, log, confirm=None) -> str:
+    def download(self, cfg: Any, log: Callable[[str], None],
+                 confirm: Optional[Callable[[str], bool]] = None) -> str:
         """Клон/fetch/checkout/pull → выгрузка рабочей копии (без .git)
         в download_folder (или source_folder) → удаление лишних файлов
         (с подтверждением confirm в GUI, безусловно в авто).
@@ -968,7 +1010,6 @@ class RepoService:
 
         repo_names = {item.name for item in workdir.iterdir()
                       if item.name not in SYNC_IGNORE}
-        nfiles = self.fs.count_files(workdir)
 
         if do_dry:
             # Dry-run: НЕ трогаем диск — только план.
@@ -1060,11 +1101,11 @@ class RepoService:
         return (f"{len(branches)} веток: " + ", ".join(branches[:10])
                 if branches else "репозиторий доступен (веток пока нет)")
 
-    def list_branches(self, cfg) -> list:
+    def list_branches(self, cfg: Any) -> list:
         """Имена удалённых веток origin (для combobox)."""
         workdir = self.ensure_layout(cfg, need_source=False)
         out = self.git.run(["branch", "-r"], cwd=workdir)
-        names = []
+        names: list = []
         for line in out.splitlines():
             name = line.strip()
             if "->" in name or not name:
@@ -1074,10 +1115,11 @@ class RepoService:
                 names.append(name)
         return names
 
-    def count_changes(self, cfg, log=None) -> int:
+    def count_changes(self, cfg: Any,
+                      _log: Optional[Callable[[str], None]] = None) -> int:
         """Число изменённых файлов в рабочей копии (для кнопки КОММИТ).
 
-        log — необязательный callable: TaskRunner передаёт его вторым
+        _log — необязательный callable: TaskRunner передаёт его вторым
         аргументом; сигнатура согласована с остальными фоновыми задачами.
         """
         repo = str(cfg.get("repository", "") or "").strip()
@@ -1090,7 +1132,7 @@ class RepoService:
             return 0
         return len([ln for ln in out.splitlines() if ln.strip()])
 
-    def reset_last(self, cfg, mode: str) -> str:
+    def reset_last(self, cfg: Any, mode: str) -> str:
         """Откат последнего локального коммита: mode='soft'|'hard'."""
         workdir = self.ensure_layout(cfg, need_source=False)
         branch = cfg.get("branch", "main") or "main"
@@ -1106,7 +1148,7 @@ class RepoService:
         self.git.run(["reset", f"--{mode}", "HEAD~1"], cwd=workdir)
         return f"Откат {mode}: убрали коммит «{last}»"
 
-    def tag(self, cfg, name: str, annotation: str, push: bool) -> str:
+    def tag(self, cfg: Any, name: str, annotation: str, push: bool) -> str:
         workdir = self.ensure_layout(cfg, need_source=False)
         args = ["tag", "-a", name]
         args += ["-m", annotation if annotation else name]
@@ -1164,20 +1206,24 @@ class AutoScheduler:
 
     MODES = ("commit", "download")
 
-    def __init__(self, on_due, interval_getter, clock=datetime.now):
-        self._on_due = on_due                    # колбэк MainWindow(mode)
-        self._interval_getter = interval_getter  # fn(mode) -> минуты
-        self._clock = clock
-        self._state = {m: {"enabled": False, "next_run_at": None}
-                       for m in self.MODES}
-        self.paused_until = None                 # «Пауза 1 ч»
+    def __init__(self,
+                 on_due: Callable[[str], Any],
+                 interval_getter: Callable[[str], int],
+                 clock: Callable[[], datetime] = datetime.now) -> None:
+        self._on_due: Callable[[str], Any] = on_due          # колбэк MainWindow(mode)
+        self._interval_getter: Callable[[str], int] = interval_getter  # fn(mode) -> минуты
+        self._clock: Callable[[], datetime] = clock
+        self._state: dict[str, dict[str, Any]] = {
+            m: {"enabled": False, "next_run_at": None} for m in self.MODES
+        }
+        self.paused_until: Optional[datetime] = None         # «Пауза 1 ч»
 
     # ------------------------------------------------------------------ #
 
     def is_enabled(self, mode: str) -> bool:
         return self._state[mode]["enabled"]
 
-    def next_run(self, mode: str):
+    def next_run(self, mode: str) -> Optional[datetime]:
         return self._state[mode]["next_run_at"]
 
     def toggle(self, mode: str, enabled: bool) -> None:
@@ -1188,13 +1234,14 @@ class AutoScheduler:
         else:
             st["next_run_at"] = None
 
-    def schedule(self, mode: str, enable: bool = True, now=None) -> None:
+    def schedule(self, mode: str, enable: bool = True,
+                 now: Optional[datetime] = None) -> None:
         """Планирует следующий запуск; enable=False — только сдвиг таймера
         (кнопка «Сейчас» при снятом чекбоксе НЕ включает авто-режим)."""
-        now = now or self._clock()
+        current = now if now is not None else self._clock()
         if enable:
             self._state[mode]["enabled"] = True
-        self._state[mode]["next_run_at"] = now + timedelta(
+        self._state[mode]["next_run_at"] = current + timedelta(
             minutes=self._interval_getter(mode))
 
     def run_now(self, mode: str) -> bool:
@@ -1215,20 +1262,25 @@ class AutoScheduler:
         self.paused_until = None
 
     def is_paused(self) -> bool:
-        return bool(self.paused_until and self._clock() < self.paused_until)
+        if self.paused_until is None:
+            return False
+        return self._clock() < self.paused_until
 
     def tick(self) -> list:
         """Список режимов, которым пора (приоритет: авто-клон первый)."""
         now = self._clock()
-        due = [m for m in ("download", "commit")
-               if self._state[m]["enabled"] and self._state[m]["next_run_at"]
-               and now >= self._state[m]["next_run_at"]]
+        due: list[str] = []
+        for m in ("download", "commit"):
+            st = self._state[m]
+            nxt: Optional[datetime] = st["next_run_at"]
+            if st["enabled"] and nxt is not None and now >= nxt:
+                due.append(m)
         return due
 
-    def next_in(self, mode: str) -> int:
+    def next_in(self, mode: str) -> Optional[int]:
         """Секунд до следующего запуска режима (None — не запланирован)."""
-        nxt = self._state[mode]["next_run_at"]
-        if not nxt:
+        nxt: Optional[datetime] = self._state[mode]["next_run_at"]
+        if nxt is None:
             return None
         return max(0, int((nxt - self._clock()).total_seconds()))
 
@@ -1251,7 +1303,7 @@ class TaskRunner:
         self.busy = False
         self.current_task = None
 
-    def start(self, kind: str, fn, *args) -> bool:
+    def start(self, kind: str, fn: Callable[..., Any], *args: Any) -> bool:
         """False, если уже занято. fn вызывается как fn(log, *args)."""
         if self.busy:
             return False
@@ -1261,7 +1313,7 @@ class TaskRunner:
                          args=(fn, *args), daemon=True).start()
         return True
 
-    def _worker(self, fn, *args):
+    def _worker(self, fn: Callable[..., Any], *args: Any) -> None:
         """Работает в фоновом потоке; в GUI пишет только через queue.Queue."""
         log = lambda msg: self._queue.put(("log", msg))       # noqa: E731
         try:
@@ -1274,9 +1326,9 @@ class TaskRunner:
             self._queue.put(("log", traceback.format_exc()))
             self._queue.put(("error", f"Ошибка: {exc}"))
 
-    def poll(self) -> list:
+    def poll(self) -> list[tuple[str, Any]]:
         """Неблокирующая выборка всех накопившихся событий."""
-        events = []
+        events: list[tuple[str, Any]] = []
         while True:
             try:
                 events.append(self._queue.get_nowait())
@@ -1284,7 +1336,7 @@ class TaskRunner:
                 break
         return events
 
-    def put(self, kind: str, payload=None):
+    def put(self, kind: str, payload: Any = None) -> None:
         """Служебная публикация события (например, из watcher-потока)."""
         self._queue.put((kind, payload))
 
@@ -1296,7 +1348,7 @@ class TaskRunner:
 # Базовые классы UI-виджетов: если tkinter недоступен (например, в CI без
 # libtk), PlaceholderEntry наследуется от object — сервисные классы при этом
 # остаются полностью рабочими и тестируемыми без Tk.
-_TTK_ENTRY_BASE = ttk.Entry if tk is not None else object
+_TTK_ENTRY_BASE = ttk.Entry if tk is not None else object  # type: ignore[assignment,misc]
 
 
 class PlaceholderEntry(_TTK_ENTRY_BASE):
@@ -1355,10 +1407,10 @@ class LogPanel:
         self.text = tk.Text(parent, height=7, state="disabled", wrap="word",
                             font=("Consolas", 9))
 
-    def pack(self, **kw):
+    def pack(self, **kw: Any) -> None:
         self.text.pack(**kw)
 
-    def grid(self, **kw):
+    def grid(self, **kw: Any) -> None:
         self.text.grid(**kw)
 
     def append(self, msg: str) -> None:
@@ -1389,13 +1441,13 @@ class ToolTip:
         widget.bind("<Leave>", self._hide, add="+")
         widget.bind("<ButtonRelease>", self._hide, add="+")
 
-    def set(self, text):
+    def set(self, text: str) -> None:
         self.text = text or ""
         if text and self.tipwindow:
             self._hide()
             self._show()
 
-    def _show(self, _e=None):
+    def _show(self, _e: Any = None) -> None:
         if not self.text:
             return
         self._hide()
@@ -1408,7 +1460,7 @@ class ToolTip:
                  borderwidth=1, font=("Segoe UI", 9), justify="left",
                  padx=6, pady=3).pack()
 
-    def _hide(self, _e=None):
+    def _hide(self, _e: Any = None) -> None:
         if self.tipwindow:
             self.tipwindow.destroy()
             self.tipwindow = None
@@ -1480,8 +1532,8 @@ class MainWindow:
         except tk.TclError:
             pass
 
-        main = ttk.Frame(root, padding=14)
-        main.pack(fill="both", expand=True)
+        main_frame = ttk.Frame(root, padding=14)
+        main_frame.pack(fill="both", expand=True)
 
         def _g(widget, **kw):
             """grid с сохранением спецификации (для compact-режима)."""
@@ -1496,7 +1548,7 @@ class MainWindow:
             return widget
 
         # --- верхняя строка: пути + кнопки "…" ----------------------------- #
-        top = ttk.Frame(main)
+        top = ttk.Frame(main_frame)
         top.pack(fill="x")
 
         self._w_folder_label = _g(ttk.Label(top, text="Папка:"),
@@ -1571,7 +1623,7 @@ class MainWindow:
         top.columnconfigure(1, weight=1)
 
         # --- большая кнопка КОММИТ ------------------------------------------ #
-        btn_frame = ttk.Frame(main)
+        btn_frame = ttk.Frame(main_frame)
         btn_frame.pack(fill="both", expand=True, pady=(14, 7))
 
         self.btn_commit = tk.Button(
@@ -1590,7 +1642,7 @@ class MainWindow:
 
         # --- кнопка ВЫГРУЗИТЬ ИЗ РЕПО + доп. git-действия -------------------- #
         self.btn_download = tk.Button(
-            main,
+            main_frame,
             text="ВЫГРУЗИТЬ ИЗ РЕПО",
             font=("Segoe UI", 12, "bold"),
             bg="#2b6cb0",
@@ -1603,7 +1655,7 @@ class MainWindow:
         )
         _p(self.btn_download, fill="x", pady=(0, 7))
 
-        tools_row = ttk.Frame(main)
+        tools_row = ttk.Frame(main_frame)
         _p(tools_row, fill="x")
         self._w_tools_git = tools_row
         ttk.Button(tools_row, text="Откатить последний",
@@ -1612,7 +1664,7 @@ class MainWindow:
                    command=self.on_create_tag).pack(side="left", padx=(6, 0))
 
         # --- авто-режимы ------------------------------------------------------ #
-        auto_frame = ttk.LabelFrame(main, text="Авто-режимы", padding=8)
+        auto_frame = ttk.LabelFrame(main_frame, text="Авто-режимы", padding=8)
         auto_frame.pack(fill="x", pady=(7, 0))
 
         self.var_auto_commit = tk.BooleanVar(value=bool(cfg.get("auto_commit")))
@@ -1705,16 +1757,16 @@ class MainWindow:
         day_row = ttk.Frame(sched_frame)
         day_row.grid(row=1, column=0, columnspan=5, sticky="w", pady=(4, 0))
         for i, name in enumerate(["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]):
-            v = tk.BooleanVar(value=(i + 1) in days)
-            self.day_vars.append(v)
-            ttk.Checkbutton(day_row, text=name, variable=v,
+            var_day = tk.BooleanVar(value=(i + 1) in days)
+            self.day_vars.append(var_day)
+            ttk.Checkbutton(day_row, text=name, variable=var_day,
                             command=self._on_settings_change).grid(row=0, column=i,
                                                                    padx=2)
 
         auto_frame.columnconfigure(1, weight=1)
 
         # --- блок чекбоксов безопасности/вида ------------------------------- #
-        self._w_checks = _p(ttk.LabelFrame(main, text="Режимы", padding=8),
+        self._w_checks = _p(ttk.LabelFrame(main_frame, text="Режимы", padding=8),
                             fill="x", pady=(7, 0))
         grid_checks = [
             ("dry_run", "Только показать (dry-run)"),
@@ -1726,15 +1778,15 @@ class MainWindow:
         ]
         self.var_checks = {}
         for i, (key, label) in enumerate(grid_checks):
-            v = tk.BooleanVar(value=bool(cfg.get(key)))
-            self.var_checks[key] = v
+            var_cb = tk.BooleanVar(value=bool(cfg.get(key)))
+            self.var_checks[key] = var_cb
             extra = {"command": lambda: self._apply_compact()} \
                 if key == "compact_view" else {"command": self._on_settings_change}
-            ttk.Checkbutton(self._w_checks, text=label, variable=v, **extra)\
+            ttk.Checkbutton(self._w_checks, text=label, variable=var_cb, **extra)\
                 .grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=2)
 
         # --- нижняя строка: статус + маленькая кнопка "..." (открыть конфиг) #
-        bottom = ttk.Frame(main)
+        bottom = ttk.Frame(main_frame)
         bottom.pack(fill="x", pady=(10, 0))
 
         self.var_status = tk.StringVar(value="Готов.")
@@ -1745,7 +1797,7 @@ class MainWindow:
                    command=self.open_config).pack(side="right")
 
         # лог последних действий
-        self.log_panel = LogPanel(main)
+        self.log_panel = LogPanel(main_frame)
         _p(self.log_panel.text, fill="x", pady=(10, 0))
         self._w_log = self.log_panel.text
 
@@ -1778,13 +1830,13 @@ class MainWindow:
     #  Лог / статус / конфиг                                              #
     # ================================================================== #
 
-    def log(self, text: str):
+    def log(self, text: str) -> None:
         self.log_panel.append(text)
 
-    def set_status(self, text: str):
+    def set_status(self, text: str) -> None:
         self.var_status.set(text)
 
-    def _interval_minutes(self, mode: str = None) -> int:
+    def _interval_minutes(self, mode: Optional[str] = None) -> int:
         # Интервалы читаем с диска — ручные правки в config.json
         # подхватываются без перезапуска приложения.
         try:
@@ -1826,7 +1878,7 @@ class MainWindow:
             v = 30
         return min(max(v, 1), 60)
 
-    def _collect_cfg(self):
+    def _collect_cfg(self) -> None:
         """Сохраняем пользовательские поля обратно в конфиг (через Config)."""
         self.cfg.set("source_folder", self.var_folder.get().strip())
         self.cfg.set("repository", self.var_repo.get().strip())
@@ -1855,20 +1907,20 @@ class MainWindow:
         })
         self.cfg.save()
 
-    def _on_settings_change(self):
+    def _on_settings_change(self) -> None:
         try:
             self._collect_cfg()
         except Exception as exc:                             # noqa: BLE001
             self.log(f"Не удалось сохранить настройки: {exc}")
 
-    def pick_folder(self):
+    def pick_folder(self) -> None:
         folder = filedialog.askdirectory(title="Папка, откуда коммитим",
                                          initialdir=self.var_folder.get() or ".")
         if folder:
             self.var_folder.set(folder)
             self._collect_cfg()
 
-    def pick_download_folder(self):
+    def pick_download_folder(self) -> None:
         folder = filedialog.askdirectory(title="Папка выгрузки из репо",
                                          initialdir=self.var_download.get()
                                          or self.var_folder.get() or ".")
@@ -1876,7 +1928,7 @@ class MainWindow:
             self.var_download.set(folder)
             self._collect_cfg()
 
-    def paste_repo_url(self):
+    def paste_repo_url(self) -> None:
         """Кнопка «…» у поля репозитория — вставить ссылку из буфера обмена."""
         try:
             clip = self.root.clipboard_get().strip()
@@ -1893,7 +1945,7 @@ class MainWindow:
                 "Скопируйте ссылку (например https://github.com/user/repo.git)\n"
                 "и нажмите «…» ещё раз — либо вставьте её в поле вручную (Ctrl+V).")
 
-    def open_config(self):
+    def open_config(self) -> None:
         """Маленькая кнопка с троеточием внизу — открыть файл конфига."""
         self._collect_cfg()
         path = config_path()
@@ -1902,7 +1954,8 @@ class MainWindow:
         self._open_in_editor(path)
         self.set_status(f"Конфиг открыт: {path.name}")
 
-    def _open_in_editor(self, path: Path) -> None:
+    @staticmethod
+    def _open_in_editor(path: Path) -> None:
         """Открыть конфиг во внешнем редакторе/просмотрщике (кроссплатформенно)."""
         try:
             if sys.platform.startswith("win"):
@@ -1927,7 +1980,7 @@ class MainWindow:
     #  Валидация в реальном времени                                       #
     # ================================================================== #
 
-    def _setup_validation(self):
+    def _setup_validation(self) -> None:
         self._tt = {}
         for kind, widget in (("folder", self._w_folder),
                              ("repo", self.var_repo),
@@ -1939,7 +1992,7 @@ class MainWindow:
             self._tt[kind] = ToolTip(widget)
             self._validate_field(kind)
 
-    def _field_value(self, kind):
+    def _field_value(self, kind) -> str:
         if kind == "folder":
             return self.var_folder.get().strip()
         if kind == "repo":
@@ -1948,14 +2001,14 @@ class MainWindow:
             return self.var_download.get().strip()
         return ""
 
-    def _field_widget(self, kind):
+    def _field_widget(self, kind) -> Any:
         if kind == "folder":
             return self._w_folder
         if kind == "repo":
             return self.var_repo
         return self._w_download
 
-    def _validate_field(self, kind):
+    def _validate_field(self, kind) -> bool:
         """Красная рамка + тултип, если значение некорректно."""
         value = self._field_value(kind)
         widget = self._field_widget(kind)
@@ -1988,7 +2041,7 @@ class MainWindow:
     #  Компактный вид                                                     #
     # ================================================================== #
 
-    def _apply_compact(self):
+    def _apply_compact(self) -> None:
         """Мини-режим: скрывает «Папку выгрузки», «Сообщение», «Ветку», лог.
 
         Остаются: Папка, Репо, КОММИТ, ВЫГРУЗИТЬ, авто-блок.
@@ -2024,7 +2077,7 @@ class MainWindow:
     #  Контекстное меню полей                                             #
     # ================================================================== #
 
-    def _build_entry_menu(self):
+    def _build_entry_menu(self) -> Any:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="Вставить", command=self._ctx_paste)
         menu.add_command(label="Копировать путь", command=self._ctx_copy)
@@ -2032,7 +2085,7 @@ class MainWindow:
         menu.add_command(label="Очистить", command=self._ctx_clear)
         return menu
 
-    def _show_entry_menu(self, event):
+    def _show_entry_menu(self, event) -> None:
         w = event.widget
         try:
             self._ctx_target = w
@@ -2040,7 +2093,7 @@ class MainWindow:
         finally:
             self._entry_menu.grab_release()
 
-    def _ctx_get(self):
+    def _ctx_get(self) -> str:
         target = self._ctx_target
         if target is None:
             return ""
@@ -2049,13 +2102,13 @@ class MainWindow:
             return ""
         return target.get()
 
-    def _ctx_set(self, value):
+    def _ctx_set(self, value) -> None:
         if self._ctx_target is None:
             return
         self._ctx_target.set(value)
         self._on_settings_change()
 
-    def _ctx_paste(self):
+    def _ctx_paste(self) -> None:
         try:
             text = self.root.clipboard_get()
         except tk.TclError:
@@ -2063,14 +2116,14 @@ class MainWindow:
         cur = self._ctx_get()
         self._ctx_set(cur + text.strip())
 
-    def _ctx_copy(self):
+    def _ctx_copy(self) -> None:
         text = self._ctx_get()
         if text:
             self.root.clipboard_clear()
             self.root.clipboard_append(text)
             self.set_status("Скопировано в буфер обмена")
 
-    def _ctx_open(self):
+    def _ctx_open(self) -> None:
         path = self._ctx_get()
         if not path:
             return
@@ -2089,14 +2142,14 @@ class MainWindow:
         except Exception as exc:                             # noqa: BLE001
             self.log(f"Не удалось открыть папку: {exc}")
 
-    def _ctx_clear(self):
+    def _ctx_clear(self) -> None:
         self._ctx_set("")
 
     # ================================================================== #
     #  Фоновые задачи (TaskRunner + queue)                                #
     # ================================================================== #
 
-    def _start_bg(self, kind: str, fn, *args) -> bool:
+    def _start_bg(self, kind: str, fn: Callable[..., Any], *args: Any) -> bool:
         """Запускает задачу в фоновом потоке. False, если уже занято.
 
         Фоновые задачи получают СНИМОК конфига (cfg.as_dict()), а не сам
@@ -2123,7 +2176,7 @@ class MainWindow:
             if key in disk_cfg:
                 cfg_snapshot[key] = disk_cfg[key]
 
-        def _runner(log, *extra):
+        def _runner(log: Callable[[str], None], *extra: Any) -> Any:
             return fn(cfg_snapshot, log, *extra)
 
         if not self.tasks.start(kind, _runner, *args):
@@ -2132,7 +2185,7 @@ class MainWindow:
         self._poll_results()
         return True
 
-    def _poll_results(self):
+    def _poll_results(self) -> None:
         """Выбирает события TaskRunner и печатает их в главном потоке Tk.
 
         Очередь TaskRunner читает ТОЛЬКО этот метод (периодический опрос);
@@ -2148,8 +2201,6 @@ class MainWindow:
                 self._handle_watch()           # watcher обслуживается и здесь
             elif kind in ("done", "error"):
                 finished = (kind, text)
-            elif kind == "branches":
-                self._apply_branch_list(text)
         if finished is not None:
             kind, text = finished
             task = self.tasks.current_task or getattr(self, "_last_kind", None)
@@ -2162,12 +2213,13 @@ class MainWindow:
             self.root.after(100, self._poll_results)
 
     @staticmethod
-    def _is_interactive(task) -> bool:
+    def _is_interactive(task: Optional[str]) -> bool:
         """Задачи по клику: их ошибки показывают messagebox."""
         return task in ("commit", "download", "test-conn", "branches",
                         "revert", "tag")
 
-    def _finish(self, kind: str, text, task, interactive: bool):
+    def _finish(self, kind: str, text: Any, task: Optional[str],
+                interactive: bool) -> None:
         # Сброс busy — в начале обработки: рабочий поток уже завершился,
         # а до _finish событие done/error из очереди никто не заберёт.
         self.tasks.busy = False
@@ -2228,7 +2280,7 @@ class MainWindow:
                 if self.cfg.get("sound_on_finish"):
                     self.notifier.play_beep()
 
-    def _refresh_buttons(self):
+    def _refresh_buttons(self) -> None:
         state = "normal" if not self.tasks.busy else "disabled"
         self.btn_commit.configure(
             state=state,
@@ -2247,7 +2299,7 @@ class MainWindow:
     #  Прямые процессы                                                    #
     # ================================================================== #
 
-    def on_commit(self):
+    def on_commit(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2261,7 +2313,7 @@ class MainWindow:
         # dry-run ничего не пишет — можно запускать даже когда он «занят»
         self._start_bg("commit", self.service.commit)
 
-    def on_download(self):
+    def on_download(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2300,7 +2352,7 @@ class MainWindow:
         # confirm=None: решение уже принято выше; лишнее чистим безусловно.
         self._start_bg("download", self.service.download, None)
 
-    def _set_busy_status(self, text: str):
+    def _set_busy_status(self, text: str) -> None:
         # Только статус/кнопки; флаг busy ставит TaskRunner.
         self.set_status(text)
         self._refresh_buttons()
@@ -2309,7 +2361,7 @@ class MainWindow:
     #  Тест соединения / список веток                                     #
     # ================================================================== #
 
-    def on_test_connection(self):
+    def on_test_connection(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2321,11 +2373,11 @@ class MainWindow:
         self._set_busy_status("Проверяю соединение с репозиторием…")
         timeout_s = min(GitRunner.net_timeout(self.cfg.as_dict()), 30)
 
-        def _test(cfg, log):
+        def _test(_cfg: Any, _log: Any) -> str:
             return self.service.test_remote(repo, timeout_s)
         self._start_bg("test-conn", _test)
 
-    def on_refresh_branches(self):
+    def on_refresh_branches(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2335,11 +2387,11 @@ class MainWindow:
             return
         self._set_busy_status("Читаю список веток…")
 
-        def _branches(cfg, log):
-            return self.service.list_branches(cfg)
+        def _branches(_cfg: Any, _log: Any) -> list:
+            return self.service.list_branches(_cfg)
         self._start_bg("branches", _branches)
 
-    def _apply_branch_list(self, names):
+    def _apply_branch_list(self, names) -> None:
         try:
             current = self.var_branch.get()
             values = list(names)
@@ -2355,7 +2407,7 @@ class MainWindow:
     #  Откат последнего коммита / теги                                    #
     # ================================================================== #
 
-    def on_revert_last(self):
+    def on_revert_last(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2373,12 +2425,12 @@ class MainWindow:
             return
         mode = "soft" if choice else "hard"
 
-        def _revert(cfg, log):
-            return self.service.reset_last(cfg, mode)
+        def _revert(_cfg: Any, _log: Any) -> str:
+            return self.service.reset_last(_cfg, mode)
         self._set_busy_status(f"Откатываю последний коммит ({mode})…")
         self._start_bg("revert", _revert)
 
-    def on_create_tag(self):
+    def on_create_tag(self) -> None:
         if self.tasks.busy:
             return
         self._collect_cfg()
@@ -2390,12 +2442,12 @@ class MainWindow:
             return
         name, annotation, push_tag = dlg
 
-        def _tag(cfg, log):
-            return self.service.tag(cfg, name, annotation, push_tag)
+        def _tag(_cfg: Any, _log: Any) -> str:
+            return self.service.tag(_cfg, name, annotation, push_tag)
         self._set_busy_status(f"Создаю тег {name}…")
         self._start_bg("tag", _tag)
 
-    def _tag_dialog(self):
+    def _tag_dialog(self) -> Any:
         """Модальное окно: имя, аннотация, чекбокс push тега."""
         win = tk.Toplevel(self.root)
         win.title("Создать тег")
@@ -2421,7 +2473,7 @@ class MainWindow:
 
         def ok(_e=None):
             name = var_name.get().strip()
-            if not name or not re.match(r"^[\w][\w./-]*$", name):
+            if not name or not re.match(r"^\w[\w./-]*$", name):
                 messagebox.showwarning(APP_TITLE, "Некорректное имя тега.",
                                        parent=win)
                 return
@@ -2445,7 +2497,7 @@ class MainWindow:
     #  Счётчик изменений на кнопке                                        #
     # ================================================================== #
 
-    def _maybe_count_changes(self):
+    def _maybe_count_changes(self) -> None:
         """Периодически (раз в ~30 с) считает git status --porcelain в фоне."""
         try:
             if (self._count_dirty and not self.tasks.busy
@@ -2455,7 +2507,7 @@ class MainWindow:
         finally:
             self.root.after(30000, self._maybe_count_changes)
 
-    def _apply_change_count(self, n):
+    def _apply_change_count(self, n) -> None:
         try:
             n = int(n)
         except (TypeError, ValueError):
@@ -2471,7 +2523,7 @@ class MainWindow:
     #  Авто-режимы (через AutoScheduler)                                  #
     # ================================================================== #
 
-    def _toggle_auto(self, mode: str):
+    def _toggle_auto(self, mode: str) -> None:
         """Чекбокс включён — планируем (НЕ запускаем сразу); выключен — сброс."""
         var = self.var_auto_commit if mode == "commit" else self.var_auto_clone
         enabled = bool(var.get())
@@ -2489,7 +2541,7 @@ class MainWindow:
         except Exception as exc:                               # noqa: BLE001
             self.log(f"Не удалось сохранить настройки: {exc}")
 
-    def _on_interval_change(self, mode):
+    def _on_interval_change(self, mode) -> None:
         """Спинбоксы интервалов: общий и индивидуальные."""
         try:
             self._collect_cfg()
@@ -2502,13 +2554,12 @@ class MainWindow:
         self.log(f"Интервалы: общий {self.var_ai.get()} мин, "
                  f"коммит {self.var_ci.get()}, клон {self.var_cl.get()}.")
 
-    def _run_auto_now(self, mode: str):
+    def _run_auto_now(self, mode: str) -> None:
         """Кнопка «Сейчас» — немедленный запуск в фоне + перепланировка."""
         self.scheduler.run_now(mode)
 
     def _launch_auto(self, mode: str) -> bool:
         """Колбэк AutoScheduler: запуск авто-задачи. True — задача пошла."""
-        now = datetime.now()
         if self.tasks.busy:
             self.log(f"{self.AUTO_LABELS[mode]}: пропуск — другая задача выполняется.")
             if self.scheduler.is_enabled(mode):
@@ -2568,7 +2619,7 @@ class MainWindow:
 
     # ---- пауза ----------------------------------------------------------- #
 
-    def toggle_pause(self):
+    def toggle_pause(self) -> None:
         if self.scheduler.is_paused():
             self.scheduler.resume()
             self.log("Пауза авто-режимов снята.")
@@ -2578,7 +2629,7 @@ class MainWindow:
             self.log(f"Авто-режимы на паузе до {until.strftime('%H:%M')}.")
         self._update_pause_button()
 
-    def _update_pause_button(self):
+    def _update_pause_button(self) -> None:
         active = self.scheduler.is_paused()
         try:
             self.btn_pause.configure(text="Снять паузу" if active else "Пауза 1 ч")
@@ -2587,11 +2638,9 @@ class MainWindow:
 
     # ---- watcher файлов --------------------------------------------------- #
 
-    def _on_toggle_watch(self):
+    def _on_toggle_watch(self) -> None:
         if self.var_watch.get():
-            try:
-                import watchdog  # noqa: F401
-            except ImportError:
+            if not _HAS_WATCHDOG:
                 self.var_watch.set(False)
                 messagebox.showinfo(
                     APP_TITLE,
@@ -2603,16 +2652,17 @@ class MainWindow:
             self._stop_watcher()
         self._on_settings_change()
 
-    def _start_watcher(self):
+    def _start_watcher(self) -> None:
+        if not _HAS_WATCHDOG:
+            self.log("watchdog не установлен — watcher не запущен "
+                     "(pip install watchdog).")
+            return
         self._stop_watcher()
         self._watch_stop = threading.Event()
         stop = self._watch_stop
 
         def _thread():
             try:
-                from watchdog.observers import Observer
-                from watchdog.events import FileSystemEventHandler
-
                 class Handler(FileSystemEventHandler):
                     def __init__(self, cb):
                         self.cb = cb
@@ -2642,17 +2692,17 @@ class MainWindow:
         self._watch_thread.start()
         self.log("Watcher за файлами папки запущен (дебаунс 30 с).")
 
-    def _stop_watcher(self):
+    def _stop_watcher(self) -> None:
         if self._watch_stop is not None:
             self._watch_stop.set()
             self._watch_stop = None
         self._watch_thread = None
 
-    def _on_watch_event(self):
+    def _on_watch_event(self) -> None:
         # Из фонового потока observer'а — только в очередь GUI.
         self.tasks.put("watch", None)
 
-    def _handle_watch(self):
+    def _handle_watch(self) -> None:
         """Событие watcher'а: старт дебаунс-окна (30 с тишины).
 
         Watcher приоритетнее таймера: из-за активности файлов таймер
@@ -2664,7 +2714,7 @@ class MainWindow:
             # сдвигаем плановый запуск таймера — приоритет у watcher'а
             self.scheduler.schedule("commit", enable=False)
 
-    def _fire_watch_commit(self):
+    def _fire_watch_commit(self) -> None:
         """Дебаунс-окно закрыто (30 с без изменений) — авто-коммит."""
         if self.tasks.busy or not self.var_watch.get():
             return
@@ -2681,7 +2731,7 @@ class MainWindow:
 
     # ---- основной тик ----------------------------------------------------- #
 
-    def _tick(self):
+    def _tick(self) -> None:
         """Единый таймер главного потока: 1 раз в секунду."""
         try:
             self._drain_events()
@@ -2689,14 +2739,14 @@ class MainWindow:
         finally:
             self.root.after(1000, self._tick)
 
-    def _drain_events(self):
+    def _drain_events(self) -> None:
         """Выборка неблокирующих событий из очереди (watch, log).
 
         done/error НЕ потребляются: единственный читатель этих событий —
         _poll_results. Чтобы тик не «съедал» завершение задачи, done/error
         возвращаются в хвост очереди (put) и будут выбраны _poll_results.
         """
-        deferred = []
+        deferred: list[tuple[str, Any]] = []
         for kind, payload in self.tasks.poll():
             if kind == "watch":
                 self._handle_watch()
@@ -2707,7 +2757,7 @@ class MainWindow:
         for ev in deferred:
             self.tasks.put(ev[0], ev[1])
 
-    def _tick_inner(self):
+    def _tick_inner(self) -> None:
         now = datetime.now()
 
         # дебаунс watcher'а: 30 с тишины -> авто-коммит
@@ -2757,7 +2807,7 @@ class MainWindow:
     #  Закрытие окна / трей                                               #
     # ================================================================== #
 
-    def _on_close_window(self):
+    def _on_close_window(self) -> None:
         if self.var_checks["tray_on_close"].get():
             if self._ensure_tray():
                 self.root.withdraw()
@@ -2797,7 +2847,7 @@ class MainWindow:
             self.log(f"Не удалось запустить трей: {exc}")
             return False
 
-    def _tray_show(self, icon=None, item=None):
+    def _tray_show(self, icon: Any = None, _item: Any = None) -> None:
         def _do():
             self.root.deiconify()
             self.root.lift()
@@ -2809,10 +2859,10 @@ class MainWindow:
                 self._tray_icon = None
         self.root.after(0, _do)
 
-    def _tray_quit(self, icon=None, item=None):
+    def _tray_quit(self, icon: Any = None, _item: Any = None) -> None:
         self.root.after(0, self._quit_app)
 
-    def _quit_app(self):
+    def _quit_app(self) -> None:
         self._force_quit = True
         if self._tray_icon is not None:
             try:
@@ -2834,7 +2884,7 @@ CommitterApp = MainWindow     # псевдоним эпохи v2
 #  main                                                                        #
 # --------------------------------------------------------------------------- #
 
-def main():
+def main() -> None:
     if tk is None:
         sys.exit(
             "Tkinter недоступен (" + _TK_ERROR_TEXT + ").\n"
@@ -2842,20 +2892,26 @@ def main():
             "на Windows и macOS tkinter входит в официальный установщик Python."
         )
     _setup_file_logging()
-    root = tk.Tk()
-    app = MainWindow(root)
-    # Проверка git при старте
+    # Проверка git ДО создания основного окна.
     ok, ver = check_git()
     if not ok:
-        messagebox.showerror(APP_TITLE,
-                             "Git не найден в системе.\n\n"
-                             "Установите git (https://git-scm.com) и перезапустите "
-                             "приложение.")
+        # Временное скрытое окно — только чтобы показать messagebox.
+        tmp = tk.Tk()
+        tmp.withdraw()
+        messagebox.showerror(
+            APP_TITLE,
+            "Git не найден в системе.\n\n"
+            "Установите git (git-scm.com) и перезапустите приложение.")
+        tmp.destroy()
         sys.exit(1)
+    assert tk is not None
+    root = tk.Tk()
+    app = MainWindow(root)
     if isinstance(ver, tuple) and len(ver) == 2:
         if ver < GIT_MIN_VERSION:
-            app.log(f"ВНИМАНИЕ: версия git {ver[0]}.{ver[1]} ниже рекомендованной "
-                    f"{GIT_MIN_VERSION[0]}.{GIT_MIN_VERSION[1]} — возможны проблемы.")
+            app.log(f"ВНИМАНИЕ: версия git {ver[0]}.{ver[1]} ниже "
+                    f"рекомендованной {GIT_MIN_VERSION[0]}.{GIT_MIN_VERSION[1]} "
+                    "— возможны проблемы.")
         else:
             app.log(f"git {ver[0]}.{ver[1]} — OK")
     elif ver:
