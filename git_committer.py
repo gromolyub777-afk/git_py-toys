@@ -18,7 +18,9 @@ Git Committer — маленькое GUI-приложение (Tkinter), кот�
 import hashlib
 import json
 import os
+import queue
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,55 +31,68 @@ from pathlib import Path
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
+    _TK_ERROR_TEXT = ""
+except Exception as _tk_exc:                       # noqa: BLE001
+    tk = None
+    _TK_ERROR_TEXT = str(_tk_exc)
 
-    class PlaceholderEntry(ttk.Entry):
-        """Поле ввода с подсказкой (placeholder), если оно пустое и не в фокусе."""
 
-        GRAY = "#999999"
-        BLACK = "#000000"
+APP_TITLE = "Git Committer"
+CONFIG_NAME = "config.json"
 
-        def __init__(self, master=None, placeholder="", **kwargs):
-            super().__init__(master, **kwargs)
-            self.placeholder = placeholder
+
+# --------------------------------------------------------------------------- #
+#  Placeholder-поле ввода                                                      #
+# --------------------------------------------------------------------------- #
+
+class PlaceholderEntry(ttk.Entry):
+    """Поле ввода с подсказкой (placeholder), если оно пустое и не в фокусе."""
+
+    GRAY = "#999999"
+    BLACK = "#000000"
+
+    def __init__(self, master=None, placeholder="", **kwargs):
+        super().__init__(master, **kwargs)
+        self.placeholder = placeholder
+        self._showing_ph = False
+        self.var = tk.StringVar(master=self)
+        self.configure(textvariable=self.var)
+        self.bind("<FocusIn>", self._on_focus_in)
+        self.bind("<FocusOut>", self._on_focus_out)
+        self._show_placeholder()
+
+    # ---- value API ---------------------------------------------------- #
+    def get(self):
+        if self._showing_ph:
+            return ""
+        return self.var.get()
+
+    def set(self, value):
+        value = value or ""
+        if value:
             self._showing_ph = False
-            self.var = tk.StringVar(master=self)
-            self.configure(textvariable=self.var)
-            self.bind("<FocusIn>", self._on_focus_in)
-            self.bind("<FocusOut>", self._on_focus_out)
+            self.configure(foreground=self.BLACK)
+            self.var.set(value)
+        else:
             self._show_placeholder()
 
-        # ---- value API ---------------------------------------------------- #
-        def get(self):
-            if self._showing_ph:
-                return ""
-            return self.var.get()
+    def _show_placeholder(self):
+        self._showing_ph = True
+        self.var.set(self.placeholder)
+        self.configure(foreground=self.GRAY)
 
-        def set(self, value):
-            value = value or ""
-            if value:
-                self._showing_ph = False
-                self.configure(foreground=self.BLACK)
-                self.var.set(value)
-            else:
-                self._show_placeholder()
+    def _hide_placeholder(self):
+        if self._showing_ph:
+            self._showing_ph = False
+            self.var.set("")
+            self.configure(foreground=self.BLACK)
 
-        def _show_placeholder(self):
-            self._showing_ph = True
-            self.var.set(self.placeholder)
-            self.configure(foreground=self.GRAY)
+    def _on_focus_in(self, _e):
+        self._hide_placeholder()
 
-        def _hide_placeholder(self):
-            if self._showing_ph:
-                self._showing_ph = False
-                self.var.set("")
-                self.configure(foreground=self.BLACK)
-
-        def _on_focus_in(self, _e):
-            self._hide_placeholder()
-
-        def _on_focus_out(self, _e):
-            if not self.var.get():
-                self._show_placeholder()
+    def _on_focus_out(self, _e):
+        if not self.var.get():
+            self._show_placeholder()
 
 
 # --------------------------------------------------------------------------- #
@@ -107,7 +122,8 @@ def default_config() -> dict:
         "author_name": "Git Committer",             # локальный автор коммита
         "author_email": "committer@local",
         "push": False,                              # пушить ли после коммита
-        "history": [],                              # последние удачные коммиты
+        "delete_extra": True,                       # удалять в репо файлы, отсутствующие в источнике
+        "history": [],                              # последние удачные коммиты (до 50)
     }
 
 
@@ -121,7 +137,9 @@ def load_config() -> dict:
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        if not isinstance(data, dict):
+            raise json.JSONDecodeError("конфиг должен быть объектом JSON", "", 0)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         # Повреждённый конфиг — не роняем приложение, пересоздаём,
         # а битый файл сохраняем рядом для отладки.
         try:
@@ -140,15 +158,21 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
+    """Атомарная запись конфига: mkstemp + os.replace; tmp чистится при ошибке."""
     path = config_path()
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp_name, path)
-    finally:
-        if os.path.exists(tmp_name):
-            os.remove(tmp_name)
+    except Exception:
+        # fd уже закрыт os.fdopen'ом (или нет) — подчищаем временный файл
+        try:
+            if os.path.exists(tmp_name):
+                os.remove(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def open_config_in_editor(path: Path) -> None:
@@ -181,8 +205,17 @@ class GitError(Exception):
     pass
 
 
-def run_git(args, cwd=None):
-    """Запуск git с захватом вывода. Бросает GitError при ненулевом коде."""
+# Таймаут одной git-команды, сек (клонирование/сеть могут быть долгими)
+GIT_TIMEOUT = 300
+
+
+def run_git(args, cwd=None, timeout=GIT_TIMEOUT):
+    """Запуск git с захватом вывода. Бросает GitError при ненулевом коде/таймауте."""
+    env = os.environ.copy()
+    # Никаких интерактивных запросов паролей и редакторов из-под GUI
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_EDITOR"] = "true"
+    env["GCM_INTERACTIVE"] = "never"        # Git Credential Manager
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -191,12 +224,16 @@ def run_git(args, cwd=None):
             text=True,
             encoding="utf-8",
             errors="replace",
+            timeout=timeout,
+            env=env,
         )
     except FileNotFoundError:
         raise GitError("Команда «git» не найдена в системе. Установите git.")
+    except subprocess.TimeoutExpired:
+        raise GitError(f"Команда «git {' '.join(args)}» не завершилась за {timeout} с.")
     if proc.returncode != 0:
-        raise GitError((proc.stderr or proc.stdout or "").strip()
-                       or f"git {' '.join(args)} завершился с ошибкой")
+        raise GitError((proc.stderr or proc.stdout or "")
+                       .strip() or f"git {' '.join(args)} завершился с ошибкой")
     return (proc.stdout or "").strip()
 
 
@@ -249,27 +286,42 @@ def ensure_repo_layout(cfg: dict) -> Path:
             "git@host:user/repo.git, file:///… или путь, оканчивающийся на .git")
 
     local = local_clone_dir(repo)
-    branch = cfg.get("branch", "main")
+    branch = cfg.get("branch", "main") or "main"
 
     if not (local / ".git").is_dir():
         run_git(["clone", repo, str(local)])
     else:
         run_git(["fetch", "origin"], cwd=local)
 
-    # Аккуратно переключаемся на нужную ветку, сохраняя незакоммиченное.
+    # ---- безопасное переключение на нужную ветку (без сброса -B) --------- #
+    def ref_exists(ref: str) -> bool:
+        """Есть ли ref; отсутствие возвращает False, прочие ошибки — GitError."""
+        try:
+            return bool(run_git(["rev-parse", "--verify", "--quiet", ref], cwd=local))
+        except GitError as exc:
+            text = str(exc)
+            if "not a valid" in text or "ambiguous" in text or "malformed" in text:
+                raise GitError(f"Некорректное имя ветки: «{branch}»")
+            return False  # код 1 = refs нет
+
     current = ""
     try:
         current = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=local)
     except GitError:
-        pass
+        pass  # например, пустой клон (unborn HEAD)
+
     if current != branch:
-        try:
+        if ref_exists(f"refs/heads/{branch}"):
             run_git(["checkout", branch], cwd=local)
-        except GitError:
-            try:
-                run_git(["checkout", "-b", branch, f"origin/{branch}"], cwd=local)
-            except GitError:
-                run_git(["checkout", "-B", branch], cwd=local)  # новая локальная ветка
+        elif ref_exists(f"refs/remotes/origin/{branch}"):
+            # ветка есть на remote — создаём локальную-трек без сброса чего-либо
+            run_git(["checkout", "-b", branch, "--track",
+                     f"origin/{branch}"], cwd=local)
+        else:
+            # ветки нигде нет — создаём новую от текущего коммита.
+            # В пустом репозитории (unborn HEAD) checkout просто переключает HEAD.
+            run_git(["checkout", "-b", branch], cwd=local)
+
     # Подтягиваем изменения с remote только если рабочая копия чистая —
     # иначе наши прошлые незапушенные коммиты/файлы останутся как есть.
     if not run_git(["status", "--porcelain"], cwd=local):
@@ -277,24 +329,60 @@ def ensure_repo_layout(cfg: dict) -> Path:
             run_git(["pull", "--ff-only", "origin", branch], cwd=local)
         except GitError:
             pass
+
+    # Если в репозитории вообще нет ни одного коммита (пустой клон),
+    # git commit не сможет определить HEAD — заводим пустой коммит.
+    try:
+        run_git(["rev-parse", "--verify", "--quiet", "HEAD"], cwd=local)
+    except GitError:
+        run_git(["commit", "--allow-empty", "-m", "Initial empty commit"],
+                cwd=local)
     return local
 
 
-def sync_source_into_repo(source: Path, workdir: Path) -> int:
-    """Копирует содержимое папки-источника в рабочую копию репозитория."""
-    import shutil
+# Папки/файлы, которые никогда не копируются в репозиторий
+SYNC_IGNORE = {".git", ".venv", "venv", "node_modules", "__pycache__",
+               ".idea", ".vscode", ".mypy_cache", ".pytest_cache"}
+
+
+def _ignore_dirs(_dir: str, names: list) -> set:
+    """shutil.copytree(ignore): отсекаем служебные каталоги и *.egg-info."""
+    ignored = {n for n in names if n in SYNC_IGNORE or n.endswith(".egg-info")}
+    return ignored
+
+
+def sync_source_into_repo(source: Path, workdir: Path, delete_extra: bool = True) -> int:
+    """
+    Копирует содержимое папки-источника в рабочую копию репозитория.
+      * пропускает служебные папки (SYNC_IGNORE);
+      * при delete_extra удаляет в рабочей копии файлы/папки, которых нет
+        в источнике (кроме .git), чтобы дерево точно отражало источник.
+    Возвращает число синхронизированных верхнеуровневых объектов.
+    """
     count = 0
-    for item in source.iterdir():
-        if item.name == ".git":
+    source_names = set()
+    for item in sorted(source.iterdir()):
+        if item.name in SYNC_IGNORE:
             continue
+        source_names.add(item.name)
         dest = workdir / item.name
         if item.is_dir():
             if dest.exists():
                 shutil.rmtree(dest)
-            shutil.copytree(item, dest)
+            shutil.copytree(item, dest, ignore=_ignore_dirs)
         else:
             shutil.copy2(item, dest)
         count += 1
+
+    if delete_extra:
+        for old in sorted(workdir.iterdir()):
+            if old.name in SYNC_IGNORE or old.name in source_names:
+                continue
+            if old.is_dir():
+                shutil.rmtree(old)
+            else:
+                old.unlink()
+
     return count
 
 
@@ -311,17 +399,12 @@ def commit_all(cfg: dict, log) -> str:
     if same:
         raise GitError("Папка-источник и рабочая копия репозитория совпадают. "
                        "Укажите отдельную папку для файлов.")
-    n = sync_source_into_repo(source, workdir)
+    n = sync_source_into_repo(source, workdir,
+                              delete_extra=bool(cfg.get("delete_extra", True)))
     log(f"Синхронизировано объектов из папки: {n}")
 
-    branch = cfg.get("branch", "main")
-    try:
-        run_git(["rev-parse", "--verify", branch], cwd=workdir)
-        run_git(["checkout", branch], cwd=workdir)
-    except GitError:
-        # новой ветки ещё нет в истории — создаём её от текущего коммита;
-        # незакоммиченные изменения (синхронизированные файлы) сохраняются
-        run_git(["checkout", "-b", branch], cwd=workdir)
+    # Ветка уже подготовлена в ensure_repo_layout (безопасный checkout/создание).
+    branch = cfg.get("branch", "main") or "main"
 
     run_git(["add", "-A"], cwd=workdir)
 
@@ -344,7 +427,7 @@ def commit_all(cfg: dict, log) -> str:
 
     sha = run_git(["rev-parse", "--short", "HEAD"], cwd=workdir)
 
-    if cfg.get("push"):
+    if cfg.get("push") and sha:
         remote_exists = False
         try:
             remotes = run_git(["remote"], cwd=workdir)
@@ -355,7 +438,7 @@ def commit_all(cfg: dict, log) -> str:
             run_git(["push", "-u", "origin", branch], cwd=workdir)
             log(f"Запушено в origin/{branch}")
         else:
-            log("Внимание: remote 'origin' отсутствует — push пропущен.")
+            raise GitError("В рабочей копии нет remote 'origin' — push невозможен.")
 
     # Записываем историю в конфиг (последние 50 коммитов)
     history = cfg.setdefault("history", [])
@@ -367,6 +450,7 @@ def commit_all(cfg: dict, log) -> str:
     })
     del history[:-50]
     save_config(cfg)
+    log(f"Коммит {sha} создан в ветке {branch}")
     return sha
 
 
@@ -412,6 +496,22 @@ class CommitterApp:
         self.var_repo.grid(row=1, column=1, sticky="ew", padx=(6, 2), pady=(6, 0))
         ttk.Button(top, text="…", width=3,
                    command=self.paste_repo_url).grid(row=1, column=2, pady=(6, 0))
+
+        # --- доп. поля: ветка / сообщение / push ---------------------------- #
+        self.var_branch = tk.StringVar(value=self.cfg.get("branch", "main"))
+        ttk.Label(top, text="Ветка:").grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.var_branch, width=18)\
+            .grid(row=2, column=1, sticky="w", padx=(6, 2), pady=(6, 0))
+
+        self.var_message = tk.StringVar(value=self.cfg.get("commit_message", ""))
+        ttk.Label(top, text="Сообщение:").grid(row=3, column=0, sticky="w", pady=(6, 0))
+        ttk.Entry(top, textvariable=self.var_message)\
+            .grid(row=3, column=1, columnspan=2, sticky="ew", padx=(6, 0), pady=(6, 0))
+
+        self.var_push = tk.BooleanVar(value=bool(self.cfg.get("push")))
+        ttk.Checkbutton(top, text="push после коммита", variable=self.var_push)\
+            .grid(row=4, column=1, sticky="w", padx=(6, 0), pady=(6, 0))
+
         top.columnconfigure(1, weight=1)
 
         # --- большая кнопка КОММИТ ----------------------------------------- #
@@ -448,6 +548,9 @@ class CommitterApp:
                                font=("Consolas", 9))
         self.log_box.pack(fill="x", pady=(10, 0))
 
+        # очередь сообщений из фонового потока (worker -> GUI)
+        self.msg_queue = queue.Queue()
+
     # ------------------------------------------------------------------ #
     #  Обработчики                                                        #
     # ------------------------------------------------------------------ #
@@ -466,6 +569,9 @@ class CommitterApp:
         """Сохраняем пользовательские поля обратно в конфиг."""
         self.cfg["source_folder"] = self.var_folder.get().strip()
         self.cfg["repository"] = self.var_repo.get().strip()
+        self.cfg["branch"] = self.var_branch.get().strip() or "main"
+        self.cfg["commit_message"] = self.var_message.get() or "Автокоммит: {datetime}"
+        self.cfg["push"] = bool(self.var_push.get())
         save_config(self.cfg)
 
     def pick_folder(self):
@@ -517,28 +623,32 @@ class CommitterApp:
         self.btn_commit.configure(state="disabled", bg="#9e9e9e",
                                   fg="white")
         self.set_status("Выполняется коммит…")
-        self._result_queue = []
+        cfg_snapshot = dict(self.cfg)          # не делим мутабельный dict с потоком
         threading.Thread(target=self._commit_worker,
-                         args=(self._result_queue,), daemon=True).start()
+                         args=(cfg_snapshot,), daemon=True).start()
         self.root.after(100, self._poll_results)
 
-    def _commit_worker(self, queue):
-        """Работает в фоновом потоке; в GUI пишет только через очередь."""
+    def _commit_worker(self, cfg: dict):
+        """Работает в фоновом потоке; в GUI пишет только через queue.Queue."""
         try:
-            sha = commit_all(self.cfg, log=lambda m: queue.append(("log", m)))
+            sha = commit_all(cfg,
+                             log=lambda m: self.msg_queue.put(("log", m)))
             if sha:
-                queue.append(("done", f"Готово: коммит {sha}"))
+                self.msg_queue.put(("done", f"Готово: коммит {sha}"))
             else:
-                queue.append(("done", "Изменений нет."))
+                self.msg_queue.put(("done", "Изменений нет."))
         except GitError as exc:
-            queue.append(("error", str(exc)))
+            self.msg_queue.put(("error", str(exc)))
         except Exception as exc:                                # noqa: BLE001
-            queue.append(("error", f"Ошибка: {exc}"))
+            self.msg_queue.put(("error", f"Ошибка: {exc}"))
 
     def _poll_results(self):
         """Выбирает сообщения из очереди и печатает их в главном потоке Tk."""
-        for kind, text in list(self._result_queue):
-            self._result_queue.remove((kind, text))
+        while True:
+            try:
+                kind, text = self.msg_queue.get_nowait()
+            except queue.Empty:
+                break
             if kind == "log":
                 self.log(text)
             elif kind == "done":
