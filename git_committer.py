@@ -15,8 +15,10 @@ Git Committer — маленькое GUI-приложение (Tkinter), кот�
 Зависимости: только стандартная библиотека Python + установленный git.
 """
 
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -27,20 +29,55 @@ from pathlib import Path
 try:
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
-except ImportError as _tk_err:          # чтобы git-логику можно было использовать/тестировать и без Tk
-    _TK_ERROR_TEXT = str(_tk_err)
 
-    tk = None
+    class PlaceholderEntry(ttk.Entry):
+        """Поле ввода с подсказкой (placeholder), если оно пустое и не в фокусе."""
 
-    def messagebox(*a, **kw):  # noqa: D103
-        raise RuntimeError("GUI недоступен")
-    def filedialog(*a, **kw):  # noqa: D103
-        raise RuntimeError("GUI недоступен")
-    def ttk(*a, **kw):  # noqa: D103
-        raise RuntimeError("GUI недоступен")
+        GRAY = "#999999"
+        BLACK = "#000000"
 
-APP_TITLE = "Git Committer"
-CONFIG_NAME = "config.json"
+        def __init__(self, master=None, placeholder="", **kwargs):
+            super().__init__(master, **kwargs)
+            self.placeholder = placeholder
+            self._showing_ph = False
+            self.var = tk.StringVar(master=self)
+            self.configure(textvariable=self.var)
+            self.bind("<FocusIn>", self._on_focus_in)
+            self.bind("<FocusOut>", self._on_focus_out)
+            self._show_placeholder()
+
+        # ---- value API ---------------------------------------------------- #
+        def get(self):
+            if self._showing_ph:
+                return ""
+            return self.var.get()
+
+        def set(self, value):
+            value = value or ""
+            if value:
+                self._showing_ph = False
+                self.configure(foreground=self.BLACK)
+                self.var.set(value)
+            else:
+                self._show_placeholder()
+
+        def _show_placeholder(self):
+            self._showing_ph = True
+            self.var.set(self.placeholder)
+            self.configure(foreground=self.GRAY)
+
+        def _hide_placeholder(self):
+            if self._showing_ph:
+                self._showing_ph = False
+                self.var.set("")
+                self.configure(foreground=self.BLACK)
+
+        def _on_focus_in(self, _e):
+            self._hide_placeholder()
+
+        def _on_focus_out(self, _e):
+            if not self.var.get():
+                self._show_placeholder()
 
 
 # --------------------------------------------------------------------------- #
@@ -64,7 +101,7 @@ def default_config() -> dict:
     """Конфиг по умолчанию — генерируется сам, без вмешательства пользователя."""
     return {
         "source_folder": str(Path.home()),          # папка, откуда коммитим
-        "repository": "",                           # путь или URL репозитория
+        "repository": "",                           # ССЫЛКА на репозиторий (URL)
         "branch": "main",                           # ветка для коммита
         "commit_message": "Автокоммит: {datetime}", # подстрока {datetime} подставится сама
         "author_name": "Git Committer",             # локальный автор коммита
@@ -163,41 +200,84 @@ def run_git(args, cwd=None):
     return (proc.stdout or "").strip()
 
 
+def is_repo_url(repo: str) -> bool:
+    """Похожа ли строка на ссылку git-репозитория?"""
+    if not repo:
+        return False
+    lowered = repo.lower()
+    if lowered.startswith(("http://", "https://", "git://", "ssh://",
+                           "git@", "file://")):
+        return True
+    # scp-подобный формат: user@host:path/repo.git (без пробелов)
+    if re.match(r"^[\w.-]+@[\w.-]+:(?!/)[\w./~@-]+$", repo):
+        return True
+    # путь, заканчивающийся на .git — тоже считаем ссылкой на репозиторий
+    if lowered.endswith(".git"):
+        return True
+    return False
+
+
+def local_clone_dir(repo_url: str) -> Path:
+    """Стабильная локальная папка для клонирования (по хешу ссылки)."""
+    digest = hashlib.sha1(repo_url.encode("utf-8")).hexdigest()[:8]
+    name = re.sub(r"[^\w.-]", "_", Path(repo_url.rstrip("/")).name) or "repo"
+    if name.endswith(".git"):
+        name = name[:-4]
+    return config_dir() / f"repo_{name}_{digest}"
+
+
 def ensure_repo_layout(cfg: dict) -> Path:
     """
-    Подготавливает рабочую область:
-      * repository может быть путём к существующему репо или URL;
-      * если это URL — клонируем/обновляем его в подпапку ./repo_<hash>;
-      * если это путь — используем как есть.
+    Подготавливает рабочую область по ССЫЛКЕ на репозиторий:
+      * repository — URL (https/git/ssh/file:// или путь .git);
+      * клонируем в подпапку ./repo_<имя>_<hash>, если её ещё нет;
+      * если есть — fetch/checkout/pull, чтобы быть в актуальном состоянии.
     Возвращает Path к рабочей копии репозитория.
     """
     repo = cfg.get("repository", "").strip()
     source = cfg.get("source_folder", "").strip()
     if not repo:
-        raise GitError("В конфиге не указан репозиторий (ключ «repository»).")
+        raise GitError("Вставьте ссылку на репозиторий (ключ «repository» в конфиге), "
+                       "например https://github.com/user/repo.git")
     if not source or not Path(source).is_dir():
         raise GitError(f"Папка-источник не существует: {source}")
 
-    is_url = ("://" in repo) or repo.endswith(".git") or repo.startswith("git@")
-    if is_url:
-        local = config_dir() / f"repo_{abs(hash(repo)) % 10**8}"
-        if not (local / ".git").is_dir():
-            run_git(["clone", repo, str(local)])
-        else:
-            branch = cfg.get("branch", "main")
-            run_git(["fetch", "origin"], cwd=local)
-            try:
-                run_git(["checkout", branch], cwd=local)
-            except GitError:
-                run_git(["checkout", "-b", branch, f"origin/{branch}"], cwd=local)
-            run_git(["pull", "--ff-only", "origin", branch], cwd=local)
-        return local
+    if not is_repo_url(repo):
+        raise GitError(
+            f"«{repo}» не похоже на ссылку на репозиторий.\n"
+            "Поддерживаются: https://…, http://…, git://…, ssh://…, "
+            "git@host:user/repo.git, file:///… или путь, оканчивающийся на .git")
 
-    repo_path = Path(repo).expanduser()
-    if not (repo_path / ".git").is_dir():
-        raise GitError(f"По адресу {repo_path} не git-репозиторий "
-                       f"(нет каталога .git).")
-    return repo_path
+    local = local_clone_dir(repo)
+    branch = cfg.get("branch", "main")
+
+    if not (local / ".git").is_dir():
+        run_git(["clone", repo, str(local)])
+    else:
+        run_git(["fetch", "origin"], cwd=local)
+
+    # Аккуратно переключаемся на нужную ветку, сохраняя незакоммиченное.
+    current = ""
+    try:
+        current = run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd=local)
+    except GitError:
+        pass
+    if current != branch:
+        try:
+            run_git(["checkout", branch], cwd=local)
+        except GitError:
+            try:
+                run_git(["checkout", "-b", branch, f"origin/{branch}"], cwd=local)
+            except GitError:
+                run_git(["checkout", "-B", branch], cwd=local)  # новая локальная ветка
+    # Подтягиваем изменения с remote только если рабочая копия чистая —
+    # иначе наши прошлые незапушенные коммиты/файлы останутся как есть.
+    if not run_git(["status", "--porcelain"], cwd=local):
+        try:
+            run_git(["pull", "--ff-only", "origin", branch], cwd=local)
+        except GitError:
+            pass
+    return local
 
 
 def sync_source_into_repo(source: Path, workdir: Path) -> int:
@@ -223,21 +303,25 @@ def commit_all(cfg: dict, log) -> str:
     workdir = ensure_repo_layout(cfg)
     source = Path(cfg["source_folder"]).expanduser()
 
-    # Реппозиторий может быть самой папкой-источником — тогда не копируем.
+    # Не копируем репозиторий сам в себя (защита от ручного конфига).
     try:
         same = source.resolve() == workdir.resolve()
     except OSError:
         same = False
-    if not same:
-        n = sync_source_into_repo(source, workdir)
-        log(f"Синхронизировано объектов из папки: {n}")
+    if same:
+        raise GitError("Папка-источник и рабочая копия репозитория совпадают. "
+                       "Укажите отдельную папку для файлов.")
+    n = sync_source_into_repo(source, workdir)
+    log(f"Синхронизировано объектов из папки: {n}")
 
     branch = cfg.get("branch", "main")
     try:
         run_git(["rev-parse", "--verify", branch], cwd=workdir)
         run_git(["checkout", branch], cwd=workdir)
     except GitError:
-        run_git(["checkout", "-B", branch], cwd=workdir)   # новая ветка
+        # новой ветки ещё нет в истории — создаём её от текущего коммита;
+        # незакоммиченные изменения (синхронизированные файлы) сохраняются
+        run_git(["checkout", "-b", branch], cwd=workdir)
 
     run_git(["add", "-A"], cwd=workdir)
 
@@ -320,13 +404,14 @@ class CommitterApp:
         ttk.Button(top, text="…", width=3,
                    command=self.pick_folder).grid(row=0, column=2)
 
-        ttk.Label(top, text="Репозиторий:").grid(row=1, column=0, sticky="w",
+        ttk.Label(top, text="Ссылка репо:").grid(row=1, column=0, sticky="w",
                                                  pady=(6, 0))
-        self.var_repo = tk.StringVar(value=self.cfg.get("repository", ""))
-        ent_repo = ttk.Entry(top, textvariable=self.var_repo)
-        ent_repo.grid(row=1, column=1, sticky="ew", padx=(6, 2), pady=(6, 0))
+        self.var_repo = PlaceholderEntry(top, placeholder="https://github.com/user/repo.git")
+        if self.cfg.get("repository"):
+            self.var_repo.set(self.cfg["repository"])
+        self.var_repo.grid(row=1, column=1, sticky="ew", padx=(6, 2), pady=(6, 0))
         ttk.Button(top, text="…", width=3,
-                   command=self.pick_repo).grid(row=1, column=2, pady=(6, 0))
+                   command=self.paste_repo_url).grid(row=1, column=2, pady=(6, 0))
         top.columnconfigure(1, weight=1)
 
         # --- большая кнопка КОММИТ ----------------------------------------- #
@@ -390,12 +475,22 @@ class CommitterApp:
             self.var_folder.set(folder)
             self._collect_cfg()
 
-    def pick_repo(self):
-        repo = filedialog.askdirectory(title="Папка git-репозитория",
-                                       initialdir=self.var_repo.get() or ".")
-        if repo:
-            self.var_repo.set(repo)
+    def paste_repo_url(self):
+        """Кнопка «…» у поля репозитория — вставить ссылку из буфера обмена."""
+        try:
+            clip = self.root.clipboard_get().strip()
+        except tk.TclError:
+            clip = ""
+        if clip and is_repo_url(clip.splitlines()[0]):
+            self.var_repo.set(clip.splitlines()[0])
             self._collect_cfg()
+            self.set_status("Ссылка вставлена из буфера обмена")
+        else:
+            messagebox.showinfo(
+                APP_TITLE,
+                "В буфере обмена нет ссылки на репозиторий.\n\n"
+                "Скопируйте ссылку (например https://github.com/user/repo.git)\n"
+                "и нажмите «…» ещё раз — либо вставьте её в поле вручную (Ctrl+V).")
 
     def open_config(self):
         """Маленькая кнопка с троеточием — открыть файл конфига."""
@@ -413,7 +508,7 @@ class CommitterApp:
         if not self.cfg.get("repository"):
             messagebox.showinfo(
                 APP_TITLE,
-                "Укажите репозиторий (поле «Репозиторий» или кнопка «…»)\n"
+                "Вставьте ссылку на репозиторий (поле «Ссылка репо» или кнопка «…» — из буфера)\n"
                 "и папку-источник, затем нажмите КОММИТ.\n\n"
                 "Кнопка «...» справа внизу открывает файл config.json.")
             return
