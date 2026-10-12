@@ -1,14 +1,18 @@
 # git_py-toys
 
-## Git Committer (`git_committer.py`)
+## Git Committer v3 (`git_committer_v3.py`)
 
-Простое GUI-приложение (Tkinter), которое **коммитит изменения из указанной папки
-в выбранный git-репозиторий** по нажатию одной большой кнопки.
+GUI-приложение (Tkinter) для двусторонней синхронизации папки и git-репозитория
+(КОММИТ / ВЫГРУЗИТЬ ИЗ РЕПО) с авто-режимами, dry-run, бэкапами, тегами и откатом.
+Версия 3 — ООП-рефакторинг по ТЗ: модульные функции и «god class» `CommitterApp`
+разложены на классы с чёткими зонами ответственности (`Config`, `GitRunner`,
+`FileSync`, `BackupManager`, `Notifier`, `RepoService`, `AutoScheduler`,
+`TaskRunner`, `LogPanel`, `MainWindow`), всё остаётся в одном `.py`.
 
 ### Запуск
 
 ```bash
-python git_committer.py
+python git_committer_v3.py
 ```
 
 Зависимости: только стандартная библиотека Python (tkinter) и установленный `git`.
@@ -53,6 +57,12 @@ python git_committer.py
 
 Необязательные ключи (`branch`, `commit_message`, `author_*`, `push`) можно править
 в конфиге через кнопку «...», но для работы достаточно указать лишь папку и репозиторий.
+
+В v3 config.json полностью владеет класс `Config` (атомарная запись, битый файл
+сохраняется как `config.broken.json`). Для старых интеграционных тестов сохранён
+тонкий compat-слой модульных функций (`load_config`, `save_config`, `run_git`,
+`commit_all`, `download_from_repo`, …) — каждая делегирует соответствующему классу,
+дублирования логики нет.
 ## Конфиг (config.json)
 
 | Ключ | Назначение |
@@ -106,9 +116,9 @@ python git_committer.py
 и статус; пропуск при пустом `repository` или отсутствии папки; флаги сохраняются
 при любом изменении.
 
-Все git-операции — в фоновом потоке, обмен с GUI через `queue.Queue`;
-`run_git` использует `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=true` и таймаут.
+Все git-операции — в фоновом потоке (`TaskRunner` + `queue.Queue`);
+`GitRunner.run` использует `GIT_TERMINAL_PROMPT=0`, `GIT_EDITOR=true` и таймаут.
 
 ```bash
-xvfb-run -a python tests/test_committer.py      # регрессия v1: 25 проверок
+xvfb-run -a python tests/test_committer.py      # регрессия: 25 проверок
 ```
