@@ -70,9 +70,11 @@ class PlaceholderEntry(ttk.Entry):
     def set(self, value):
         value = value or ""
         if value:
-            self._showing_ph = False
-            self.configure(foreground=self.BLACK)
+            # мёртвый дубль убран: раньше здесь вручную сбрасывался флаг/цвет,
+            # теперь всё делает _hide_placeholder() + установка foreground.
+            self._hide_placeholder()
             self.var.set(value)
+            self.configure(foreground=self.BLACK)
         else:
             self._show_placeholder()
 
@@ -158,15 +160,23 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    """Атомарная запись конфига: mkstemp + os.replace; tmp чистится при ошибке."""
+    """Атомарная запись конфига: mkstemp + os.replace; tmp/fd чистятся при ошибке."""
     path = config_path()
     tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    fd_owned = False
     try:
-        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+        f = os.fdopen(tmp_fd, "w", encoding="utf-8")
+        fd_owned = True
+        with f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
         os.replace(tmp_name, path)
     except Exception:
-        # fd уже закрыт os.fdopen'ом (или нет) — подчищаем временный файл
+        # Если os.fdopen бросил исключение — fd всё ещё наш, закрываем сами.
+        if not fd_owned:
+            try:
+                os.close(tmp_fd)
+            except OSError:
+                pass
         try:
             if os.path.exists(tmp_name):
                 os.remove(tmp_name)
