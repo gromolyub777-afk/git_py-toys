@@ -294,12 +294,15 @@ def _ignore_dirs(_dir: str, names: list[str]) -> set[str]:
     return _ignore_dirs_factory()(_dir, names)
 
 
-def _replace_item(src: Path, dst: Path) -> None:
+def _replace_item(src: Path, dst: Path) -> bool:
     """Безопасно заменяет dst содержимым src (ТЗ v4, задача 1.4).
+
+    FIX-3.8: возвращает True при успехе, False — если элемент не удалось
+    заменить (OSError логируется). Вызывающий не обязан оборачивать вызов
+    в try/except OSError ради управления потоком.
 
     Если dst существует (или является симлинком): директория без симлинка —
     rmtree, иначе unlink. Затем copytree для папок и copy2 для файлов.
-    OSError логируется, но не прерывает синхронизацию остальных файлов.
     """
     try:
         if dst.exists() or dst.is_symlink():
@@ -311,9 +314,10 @@ def _replace_item(src: Path, dst: Path) -> None:
             shutil.copytree(src, dst, ignore=_ignore_dirs)
         else:
             shutil.copy2(src, dst)
+        return True
     except OSError as exc:
         _log_to_file(f"Не удалось заменить «{dst}» ({exc})", logging.WARNING)
-        raise
+        return False
 
 
 def validate_branch_name(branch: str, cwd: Any = None) -> str:
@@ -627,7 +631,8 @@ class Config:
             "auto_clone_interval_min": 0,                # 0 = использовать общий
             "download_folder": "",                       # куда выгружать ('' = source)
             # ---- v2.1 ----------------------------------------------------
-            "version": 2,                                # схема конфига
+            # FIX-3.4: ключ "version" объявлен ровно один раз — ниже, в
+            # блоке v4. Здесь оставлен только маркер эпохи.
             "last_version": __version__,                 # версия приложения при записи
             "git_timeout_min": 30,                       # таймаут сетевых git-команд, мин
             "auto_schedule": {"enabled": False, "from": "09:00", "to": "18:00",
@@ -981,10 +986,10 @@ class FileSync:
                     copied += FileSync._copy_tree(item, dest, ignore_patterns,
                                                   gitignore_rules, base)
                 else:
-                    _replace_item(item, dest)
-                    copied += 1
+                    if _replace_item(item, dest):
+                        copied += 1
             except OSError:
-                continue                       # один файл — не повод всё ронять
+                continue                       # ошибки чтения каталога — не повод ронять
         return copied
 
     @staticmethod
@@ -1022,7 +1027,9 @@ class FileSync:
                     dest.mkdir(parents=True, exist_ok=True)
                     FileSync._copy_tree(item, dest, patterns, gi_rules)
                 else:
-                    _replace_item(item, dest)
+                    if _replace_item(item, dest):
+                        count += 1
+                        continue
                 count += 1
             except OSError:
                 continue
@@ -1047,21 +1054,29 @@ class FileSync:
     @staticmethod
     def from_repo(workdir: Path, target: Path,
                   confirm: Optional[Callable[[Path], bool]] = None,
-                  delete_extra: bool = False, cfg: Any = None) -> tuple:
+                  delete_extra: bool = False, cfg: Any = None,
+                  tracked: Optional[set] = None) -> tuple:
         """Выгрузка содержимого рабочей копии (без .git) поверх целевой папки.
 
-        delete_extra=False (дефолт ТЗ 1.5) — лишние файлы цели НЕ удаляются.
-        confirm(target)->bool решает судьбу «лишних» файлов (тех, которых нет
-        в репо); confirm=None при включённом delete_extra — удалять безусловно.
-        Служебные объекты (SYNC_IGNORE) и .gitignore не удаляем никогда.
-        Возвращает (число скопированных объектов, список удалённых путей,
-        флаг отмены, число лишних объектов).
+        FIX-3.6: единственный путь выгрузки; download() больше не имеет
+        собственной копии логики.
+
+        * delete_extra=False (дефолт ТЗ 1.5) — лишние файлы цели НЕ удаляются.
+        * confirm(target)->bool решает судьбу «лишних» файлов; confirm=None
+          при включённом delete_extra — удалять безусловно.
+        * tracked — множество верхнеуровневых имён из `git ls-files`; если
+          передано, файлы с такими именами лишними не считаются.
+        * Служебные объекты (SYNC_IGNORE) и PROTECT_FROM_DELETE (.gitignore)
+          не удаляются никогда; удаления пишутся в deleted_files.log.
+
+        Возвращает (copied, removed, cancelled, extras_count).
         """
         workdir, target = Path(workdir), Path(target)
         repo_names = {item.name for item in workdir.iterdir()
                       if item.name not in SYNC_IGNORE}
+        keep_names = repo_names | (tracked or set())
         extras = [p for p in sorted(target.iterdir())
-                  if p.name not in repo_names and p.name not in SYNC_IGNORE
+                  if p.name not in keep_names and p.name not in SYNC_IGNORE
                   and p.name not in PROTECT_FROM_DELETE] \
             if target.is_dir() else []
         do_clean = bool(extras) and bool(delete_extra)
@@ -1080,11 +1095,9 @@ class FileSync:
             if matches_sync_ignore(item.name, patterns):
                 continue
             dest = target / item.name
-            try:
-                _replace_item(item, dest)
+            # FIX-3.8: _replace_item возвращает bool.
+            if _replace_item(item, dest):
                 copied += 1
-            except OSError:
-                continue
 
         removed = []
         if extras and do_clean:
@@ -1103,7 +1116,11 @@ class FileSync:
 
     @staticmethod
     def copy_repo_items(workdir: Path, target: Path, cfg: Any = None) -> int:
-        """Только копирование (без чистки лишнего) — используется в download."""
+        """FIX-3.6: используется только в симуляции count_changes.
+
+        Основной путь выгрузки — FileSync.from_repo. Здесь оставлен для
+        точного подсчёта изменений, где чистка не нужна и нежелательна.
+        """
         workdir, target = Path(workdir), Path(target)
         target.mkdir(parents=True, exist_ok=True)
         patterns = sync_ignore_patterns(cfg) if cfg is not None else []
@@ -1114,11 +1131,8 @@ class FileSync:
             if matches_sync_ignore(item.name, patterns):
                 continue
             dest = target / item.name
-            try:
-                _replace_item(item, dest)
+            if _replace_item(item, dest):
                 copied += 1
-            except OSError:
-                continue
         return copied
 
     @staticmethod
@@ -1837,72 +1851,35 @@ class RepoService:
         # Защита от рекурсии (ТЗ v4, задача 1.3): все проверки до операций.
         guard_recursive_sync(None, workdir, target_path)
 
-        repo_names = {item.name for item in workdir.iterdir()
-                      if item.name not in SYNC_IGNORE}
-
-        target_path.mkdir(parents=True, exist_ok=True)
-
-        # Точный список лишних файлов — которых нет в репо (git ls-files),
-        # а не всех файлов target (ТЗ v4, задача 2.5).
+        # FIX-3.6: лишние считаем через FileSync.from_repo — единая точка.
         try:
             tracked = {ln.split("/", 1)[0] for ln in
                        self.git.run(["ls-files"], cwd=workdir).splitlines()
                        if ln.strip()}
         except GitError:
-            tracked = repo_names
-        keep_names = repo_names | tracked
-        extras = [p for p in sorted(target_path.iterdir())
-                  if p.name not in keep_names and p.name not in SYNC_IGNORE
-                  and p.name not in PROTECT_FROM_DELETE] \
-            if target_path.is_dir() else []
-        # Лишние удаляем ТОЛЬКО при включённом delete_extra (безопасный
-        # режим по умолчанию — ТЗ v4, задача 1.5); confirm решает судьбу.
-        do_clean = bool(extras) and bool(cfg.get("delete_extra", False))
-        if extras and do_clean and confirm is not None:
-            do_clean = bool(confirm(str(target_path)))
-        elif extras and do_clean and confirm is None \
-                and needs_extra_confirmation(len(extras)):
-            # Авто-режим (без диалога): массовое удаление не блокируем,
-            # но предупреждаем в логе (ТЗ v4, задача 1.5).
-            log(f"Внимание: автоматически удаляется лишних файлов: "
-                f"{len(extras)} (> {DELETE_CONFIRM_THRESHOLD}).")
-        if extras and not do_clean and cfg.get("delete_extra", False):
-            log(f"Удаление лишних файлов в «{target_path}» отменено "
-                f"(осталось {len(extras)} объектов).")
-        if extras and do_clean:
-            # Автобэкап целевой папки ПЕРЕД любыми изменениями на диске.
-            if cfg.get("backup_before_download", True):
-                try:
-                    self.backup.backup(target_path, log=log)
-                except Exception as exc:                         # noqa: BLE001
-                    raise GitError(f"Не удалось создать бэкап целевой папки "
-                                   f"({exc}) — выгрузка прервана, диск не тронут.")
-        elif target_path.is_dir() and cfg.get("backup_before_download", True) \
-                and any(target_path.iterdir()):
-            # Даже без удаления лишнего файлы репо перезаписываются — бэкапим.
+            tracked = set()
+
+        target_path.mkdir(parents=True, exist_ok=True)
+        backup_needed = (bool(cfg.get("delete_extra", False))
+                         or any(target_path.iterdir()))
+        if backup_needed and cfg.get("backup_before_download", True):
             try:
                 self.backup.backup(target_path, log=log)
             except Exception as exc:                             # noqa: BLE001
                 raise GitError(f"Не удалось создать бэкап целевой папки "
                                f"({exc}) — выгрузка прервана, диск не тронут.")
 
-        # Копируем содержимое рабочей копии (без .git и служебных папок) поверх
-        # целевой папки — файлы репозитория всегда актуальны.
-        copied = self.fs.copy_repo_items(workdir, target_path)
-
-        if extras and do_clean:
-            removed = []
-            for old_item in extras:
-                try:
-                    if old_item.is_dir() and not old_item.is_symlink():
-                        shutil.rmtree(old_item)
-                    else:
-                        old_item.unlink()
-                    removed.append(old_item)
-                except OSError as exc:
-                    _log_to_file(f"Не удалось удалить «{old_item}» ({exc})",
-                                 logging.WARNING)
-            _log_deleted(removed, "download delete_extra")
+        copied, removed, cancelled, extras_count = self.fs.from_repo(
+            workdir, target_path,
+            confirm=confirm,
+            delete_extra=bool(cfg.get("delete_extra", False)),
+            cfg=cfg,
+            tracked=tracked,
+        )
+        if cancelled:
+            log(f"Удаление лишних файлов в «{target_path}» отменено "
+                f"(осталось {extras_count} объектов).")
+        if removed:
             log(f"Удалено лишних объектов в «{target_path}»: {len(removed)}")
 
         tgt_files = self.fs.count_files(target_path)
@@ -1914,9 +1891,52 @@ class RepoService:
             "message": f"Выгружено в {target_path}",
         })
         log_event("sync_files", direction="download", copied=copied,
-                  deleted=len(extras) if do_clean else 0)
+                  deleted=len(removed))
         log(f"Выгружено из {branch}@{sha}: {copied} объектов, {tgt_files} файлов → {target_path}")
         return sha
+
+    def preview_extras(self, cfg: Any, target_path: Path) -> list:
+        """FIX-3.2: список «лишних» объектов в целевой папке.
+
+        Критерий совпадает с фактической чисткой в download():
+          * в target есть, но нет среди верхнеуровневых имён workdir;
+          * не входит в SYNC_IGNORE;
+          * не входит в PROTECT_FROM_DELETE.
+        Если workdir существует, дополнительно исключаем имена, попавшие в
+        `git ls-files` (это трекаемые файлы — их удалять нельзя).
+
+        Возвращает отсортированный список Path; при недоступной target —
+        пустой список. Никаких записей на диск.
+        """
+        target_path = Path(target_path)
+        if not target_path.is_dir():
+            return []
+        repo = str(cfg.get("repository", "") or "").strip()
+        workdir = local_clone_dir(repo)
+        repo_names: set = set()
+        if (workdir / ".git").is_dir():
+            try:
+                repo_names = {item.name for item in workdir.iterdir()
+                              if item.name not in SYNC_IGNORE}
+                tracked = {ln.split("/", 1)[0] for ln in
+                           self.git.run(["ls-files"], cwd=workdir).splitlines()
+                           if ln.strip()}
+                repo_names |= tracked
+            except (GitError, OSError):
+                repo_names = set()
+        extras = []
+        try:
+            for p in sorted(target_path.iterdir()):
+                if p.name in repo_names:
+                    continue
+                if p.name in SYNC_IGNORE:
+                    continue
+                if p.name in PROTECT_FROM_DELETE:
+                    continue
+                extras.append(p)
+        except OSError:
+            return []
+        return extras
 
     def download_plan(self, cfg: Any, log: Callable[[str], None]) -> str:
         """План ВЫГРУЗКИ без clone/fetch/checkout и без записи на диск (ТЗ 2.1).
@@ -2307,14 +2327,30 @@ class TaskRunner:
             self._queue.put(("log", traceback.format_exc()))
             self._queue.put(("error", f"Ошибка: {exc}"))
 
-    def poll(self) -> list[tuple[str, Any]]:
-        """Неблокирующая выборка всех накопившихся событий."""
+    def poll(self, skip: frozenset = frozenset()) -> list[tuple[str, Any]]:
+        """Неблокирующая выборка событий.
+
+        FIX-3.5: параметр skip — типы событий, которые нужно вернуть в
+        очередь (а не извлечь). Используется _drain_events, чтобы не
+        «съедать» done/error: единственный их потребитель — _poll_results.
+        """
         events: list[tuple[str, Any]] = []
+        deferred: list[tuple[str, Any]] = []
         while True:
             try:
                 events.append(self._queue.get_nowait())
             except queue.Empty:
                 break
+        if skip:
+            keep: list[tuple[str, Any]] = []
+            for ev in events:
+                if ev[0] in skip:
+                    deferred.append(ev)
+                else:
+                    keep.append(ev)
+            events = keep
+            for ev in deferred:
+                self._queue.put(ev)
         return events
 
     def put(self, kind: str, payload: Any = None) -> None:
@@ -2669,10 +2705,11 @@ class MainWindow:
                    command=lambda: self._run_auto_now("commit"))\
             .grid(row=0, column=2, sticky="e")
         ttk.Label(auto_frame, text="интервал, мин:").grid(row=0, column=3, sticky="e")
-        self.var_ci = tk.IntVar(value=self._clamp_interval(
-            cfg.get("auto_commit_interval_min")
-            or cfg.get("auto_interval_min", 5)))
-        ttk.Spinbox(auto_frame, from_=1, to=60, width=4, textvariable=self.var_ci,
+        self.var_ci = tk.IntVar(value=self._clamp_interval_or_zero(
+            cfg.get("auto_commit_interval_min", 0)))
+        # FIX-3.3: from_=0 — «0 = общий интервал».
+        ttk.Spinbox(auto_frame, from_=0, to=60, width=4,
+                    textvariable=self.var_ci,
                     command=lambda: self._on_interval_change("commit"))\
             .grid(row=0, column=4, sticky="w", padx=(2, 0))
 
@@ -2686,10 +2723,10 @@ class MainWindow:
             .grid(row=1, column=2, sticky="e", pady=(4, 0))
         ttk.Label(auto_frame, text="интервал, мин:").grid(row=1, column=3,
                                                           sticky="e", pady=(4, 0))
-        self.var_cl = tk.IntVar(value=self._clamp_interval(
-            cfg.get("auto_clone_interval_min")
-            or cfg.get("auto_interval_min", 5)))
-        ttk.Spinbox(auto_frame, from_=1, to=60, width=4, textvariable=self.var_cl,
+        self.var_cl = tk.IntVar(value=self._clamp_interval_or_zero(
+            cfg.get("auto_clone_interval_min", 0)))
+        ttk.Spinbox(auto_frame, from_=0, to=60, width=4,
+                    textvariable=self.var_cl,
                     command=lambda: self._on_interval_change("download"))\
             .grid(row=1, column=4, sticky="w", padx=(2, 0), pady=(4, 0))
 
@@ -2863,11 +2900,21 @@ class MainWindow:
 
     @staticmethod
     def _clamp_interval(v) -> int:
+        """Общий интервал: строго 1..60 (0 недопустим)."""
         try:
             v = int(v)
         except (TypeError, ValueError):
             v = 5
         return min(max(v, 1), 60)
+
+    @staticmethod
+    def _clamp_interval_or_zero(v) -> int:
+        """FIX-3.3: интервал конкретного режима; 0 означает «общий»."""
+        try:
+            v = int(v)
+        except (TypeError, ValueError):
+            v = 0
+        return min(max(v, 0), 60)
 
     @staticmethod
     def _clamp_timeout(v) -> int:
@@ -2890,10 +2937,11 @@ class MainWindow:
         self.cfg.set("auto_clone", bool(self.var_auto_clone.get()))
         self.cfg.set("git_timeout_min", self._clamp_timeout(self.var_timeout.get()))
         self.cfg.set("auto_interval_min", self._clamp_interval(self.var_ai.get()))
+        # FIX-3.3: индивидуальные интервалы сохраняют 0 = «использовать общий».
         self.cfg.set("auto_commit_interval_min",
-                     self._clamp_interval(self.var_ci.get()))
+                     self._clamp_interval_or_zero(self.var_ci.get()))
         self.cfg.set("auto_clone_interval_min",
-                     self._clamp_interval(self.var_cl.get()))
+                     self._clamp_interval_or_zero(self.var_cl.get()))
         for key, var in self.var_checks.items():
             self.cfg.set(key, bool(var.get()))
         self.cfg.set("watch_source", bool(self.var_watch.get()))
@@ -2907,6 +2955,22 @@ class MainWindow:
         self.cfg.save()
 
     def _on_settings_change(self) -> None:
+        """FIX-3.7: дебаунс записи config.json (300 мс).
+
+        Спинбоксы и чекбоксы дёргают этот метод на каждый клик; писать
+        конфиг на каждое нажатие — лишние read-modify-write истории и
+        микрофризы. Откладываем через root.after и сливаем серию в одну
+        запись.
+        """
+        if getattr(self, "_settings_debounce_id", None):
+            try:
+                self.root.after_cancel(self._settings_debounce_id)
+            except tk.TclError:
+                pass
+        self._settings_debounce_id = self.root.after(300, self._do_save_settings)
+
+    def _do_save_settings(self) -> None:
+        self._settings_debounce_id = None
         try:
             self._collect_cfg()
         except Exception as exc:                             # noqa: BLE001
@@ -3411,28 +3475,36 @@ class MainWindow:
                 APP_TITLE,
                 "Укажите «Папку выгрузки» (или «Папку») — куда выложить содержимое репозитория.")
             return
-        # Подтверждение нужно только если в целевой папке есть файлы, которых
-        # нет в репозитории (их придётся удалить) И стоит флаг confirm_delete_extras.
         target = str(self.cfg.get("download_folder") or "").strip() \
             or str(self.cfg.get("source_folder") or "").strip()
-        extras = 0
-        try:
-            tp = Path(target)
-            if tp.is_dir():
-                extras = sum(1 for p in tp.iterdir()
-                             if p.name not in SYNC_IGNORE)
-        except OSError:
-            pass
-        if extras and self.cfg.get("confirm_delete_extras", True) \
-                and not messagebox.askyesno(
-                APP_TITLE,
-                f"В целевой папке {extras} объектов, которых нет в репозитории — "
-                "они будут удалены.\nФайлы репозитория будут выгружены поверх.\n\n"
-                "Продолжить?"):
-            self.log("Выгрузка отменена пользователем.")
-            return
+        target_path = Path(target)
+
+        # FIX-3.2: диалог показываем ТОЛЬКО когда реально будем удалять —
+        # delete_extra=True, confirm_delete_extras=True, есть лишние файлы.
+        # Список лишних берём через RepoService.preview_extras: он совпадает
+        # с фактической чисткой (учитывает PROTECT_FROM_DELETE и ls-files).
+        if (self.cfg.get("delete_extra", False)
+                and self.cfg.get("confirm_delete_extras", True)):
+            extras_preview = self.service.preview_extras(
+                self.cfg.as_dict(), target_path)
+            if extras_preview:
+                # Показываем до 20 строк, дальше — многоточие.
+                shown = "\n".join(f"  • {p.name}" for p in extras_preview[:20])
+                more = (f"\n  … и ещё {len(extras_preview) - 20}"
+                        if len(extras_preview) > 20 else "")
+                if not messagebox.askyesno(
+                    APP_TITLE,
+                    f"В целевой папке {len(extras_preview)} объектов, которых "
+                    "нет в репозитории. Они будут УДАЛЕНЫ "
+                    "(delete_extra=ВКЛ).\n"
+                    "Файлы репозитория будут выгружены поверх.\n\n"
+                    f"{shown}{more}\n\nПродолжить?"):
+                    self.log("Выгрузка отменена пользователем.")
+                    return
+
         self._set_busy_status("Выгружаем из репо…")
-        # confirm=None: решение уже принято выше; лишнее чистим безусловно.
+        # confirm=None: решение принято выше; RepoService не будет спрашивать
+        # повторно, а на массовое удаление оставит запись в логе.
         self._start_bg("download", self.service.download, None)
 
     def _set_busy_status(self, text: str) -> None:
@@ -3895,23 +3967,23 @@ class MainWindow:
         finally:
             self.root.after(1000, self._tick)
 
-    def _drain_events(self) -> None:
-        """Выборка неблокирующих событий из очереди (watch, log).
+    # FIX-3.5: типы событий, которые НЕ должен извлекать _drain_events —
+    # их читает только _poll_results.
+    _POLL_KINDS = frozenset({"done", "error"})
 
-        done/error НЕ потребляются: единственный читатель этих событий —
-        _poll_results. Чтобы тик не «съедал» завершение задачи, done/error
-        возвращаются в хвост очереди (put) и будут выбраны _poll_results.
+    def _drain_events(self) -> None:
+        """Выборка watch/log из очереди TaskRunner.
+
+        FIX-3.5: done/error через poll(skip=...) остаются в очереди и
+        доставляются _poll_results. Второго потребителя нет — гонки за
+        событием больше не будет.
         """
-        deferred: list[tuple[str, Any]] = []
-        for kind, payload in self.tasks.poll():
+        for kind, payload in self.tasks.poll(skip=self._POLL_KINDS):
             if kind == "watch":
                 self._handle_watch()
             elif kind == "log":
                 self.log(payload)
-            else:  # done/error/branches — вернём в очередь для _poll_results
-                deferred.append((kind, payload))
-        for ev in deferred:
-            self.tasks.put(ev[0], ev[1])
+            # done/error здесь появиться не могут — их отсекает skip.
 
     def _tick_inner(self) -> None:
         now = datetime.now()
@@ -3969,6 +4041,13 @@ class MainWindow:
     def _quit_app(self) -> None:
         self._force_quit = True
         self._stop_watcher()
+        # FIX-3.7: снять отложенный debounce и записать настройки сразу.
+        if getattr(self, "_settings_debounce_id", None):
+            try:
+                self.root.after_cancel(self._settings_debounce_id)
+            except tk.TclError:
+                pass
+            self._settings_debounce_id = None
         try:
             self._collect_cfg()
         except Exception:                                    # noqa: BLE001
