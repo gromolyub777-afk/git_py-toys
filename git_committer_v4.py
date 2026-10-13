@@ -131,6 +131,11 @@ DELETE_LIST_THRESHOLD = 20
 CHANGE_COUNT_TTL = 30.0
 CHANGE_COUNT_CACHE_TTL = CHANGE_COUNT_TTL
 
+# FIX-4.4: тексты большой кнопки коммита — без магических срезов.
+BTN_COMMIT_TEXT = "КОММИТ"
+BTN_DRY_RUN_PREFIX = "DRY-RUN"
+
+
 # Предустановки фильтров синхронизации (ТЗ v4, задача 4.3)
 SYNC_PRESETS = {
     "Python": "__pycache__,*.pyc,.pytest_cache,.mypy_cache,*.egg-info,.venv",
@@ -244,8 +249,25 @@ def is_repo_url(repo: str) -> bool:
             if " " in host or " " in path:
                 return False
             return True
-    if lowered.startswith("git@") or lowered.startswith("ssh://"):
-        return True if lowered.startswith("ssh://") else bool(_SCP_LIKE_RE.match(candidate))
+    if lowered.startswith("ssh://"):
+        # FIX-4.5: для ssh:// проверяем hostname так же строго, как для http(s).
+        try:
+            parts = urlsplit(candidate)
+        except ValueError:
+            return False
+        if parts.scheme.lower() != "ssh":
+            return False
+        host = (parts.hostname or "").strip()
+        path = parts.path or ""
+        if not host or " " in host or "\t" in host:
+            return False
+        if " " in path or "\t" in path:
+            return False
+        # hostname без точки допустим (localhost/внутренний хост), но пустым
+        # быть не должен — это уже проверено.
+        return True
+    if lowered.startswith("git@"):
+        return bool(_SCP_LIKE_RE.match(candidate))
     # scp-подобный формат user@host:path (без ведущей «/» в пути)
     if _SCP_LIKE_RE.match(candidate):
         return True
@@ -417,10 +439,38 @@ def is_gitignored(rel_path: str, rules: list[str]) -> bool:
     return False
 
 
+# FIX-4.2: порог ротации deleted_files.log — 5 МБ.
+DELETED_LOG_MAX_BYTES = 5_000_000
+
+
+def _rotate_deleted_log(log_file: Path) -> None:
+    """FIX-4.2: при превышении размера переименовать файл в .log.1.
+
+    Не используем RotatingFileHandler: запись сюда редкая, плодить
+    логгер и его состояние смысла нет. Один шаг ротации (текущий + .1)
+    достаточен — файл нужен лишь для аудита последних удалений.
+    """
+    try:
+        if not log_file.exists():
+            return
+        if log_file.stat().st_size < DELETED_LOG_MAX_BYTES:
+            return
+        rotated = log_file.with_suffix(log_file.suffix + ".1")
+        if rotated.exists():
+            try:
+                rotated.unlink()
+            except OSError:
+                pass
+        log_file.replace(rotated)
+    except OSError:
+        pass
+
+
 def _log_deleted(paths: list[Any], reason: str) -> None:
     """Журнал всех удалений в deleted_files.log (ТЗ 1.5)."""
     try:
         log_file = config_path().parent / DELETED_LOG_NAME
+        _rotate_deleted_log(log_file)
         stamp = datetime.now().isoformat(timespec="seconds")
         with open(log_file, "a", encoding="utf-8") as f:
             for p in paths:
@@ -616,7 +666,11 @@ class Config:
             "repository": "",                            # ССЫЛКА на репозиторий (URL)
             "branch": "main",                            # ветка для коммита
             "commit_message": "Автокоммит: {datetime}",  # {datetime} подставится сама
-            "author_name": "Git Committer",              # локальный автор коммита
+            # FIX-4.8: дефолтный автор — технический, для работы «из коробки».
+            # Если пользователь не переопределит в настройках, все коммиты
+            # уйдут от этого автора. check_git_identity() предупредит, если
+            # поле в config.json пустое, но не мешает дефолту.
+            "author_name": "Git Committer",
             "author_email": "committer@local",
             "push": False,                               # пушить после ручного КОММИТА
             # ТЗ v4 1.5: зеркальная чистка ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА — файлы
@@ -763,6 +817,27 @@ class Config:
     def reload(self) -> None:
         """Перечитать диск (ручные правки config.json подхватываются на лету)."""
         self.load()
+
+    def reload_history(self) -> list:
+        """FIX-5.2: перечитать только history с диска в self._data.
+
+        Возвращает актуальный список (после загрузки). Читает файл напрямую
+        (без side-effect save() из load()) — используется UI перед показом
+        окна истории, чтобы увидеть записи, добавленные фоновыми потоками.
+        """
+        disk_hist: list = []
+        try:
+            if self._path.exists():
+                with open(self._path, "r", encoding="utf-8") as f:
+                    disk_data = json.load(f)
+                if isinstance(disk_data, dict):
+                    hist = disk_data.get("history")
+                    if isinstance(hist, list):
+                        disk_hist = hist
+        except (OSError, ValueError):
+            pass
+        self._data["history"] = disk_hist
+        return disk_hist
 
     def get(self, key: str, default: Any = None) -> Any:
         return self._data.get(key, default)
@@ -1004,6 +1079,8 @@ class FileSync:
             в источнике (кроме .git и защищённого .gitignore!), чтобы дерево
             точно отражало источник; удаления пишутся в deleted_files.log.
         Возвращает число синхронизированных верхнеуровневых объектов.
+        Папки верхнего уровня считаются при успешном создании каталога,
+        файлы — только при успешной замене (FIX-5.1).
         """
         source, workdir = Path(source), Path(workdir)
         patterns = sync_ignore_patterns(cfg) if cfg is not None else []
@@ -1026,11 +1103,13 @@ class FileSync:
                     # содержимое папки сливаем поверх существующей (инкрементально)
                     dest.mkdir(parents=True, exist_ok=True)
                     FileSync._copy_tree(item, dest, patterns, gi_rules)
+                    count += 1
                 else:
+                    # FIX-5.1: файл учитывается только при успехе копирования.
+                    # Раньше провал _replace_item всё равно попадал на
+                    # внешний count += 1 и завышал «Синхронизировано».
                     if _replace_item(item, dest):
                         count += 1
-                        continue
-                count += 1
             except OSError:
                 continue
 
@@ -1283,8 +1362,9 @@ class Notifier:
                     if os.path.exists(wav) and shutil.which("paplay"):
                         subprocess.run(["paplay", wav], timeout=5, check=False)  # noqa: S603, PLW1510
                     else:
-                        # /dev/snd/beeper не существует — единственный
-                        # остаточный fallback: ASCII bell в stderr
+                        # FIX-4.6: ASCII-bell как fallback для headless-
+                        # окружений, где нет системного аудиоплеера
+                        # (paplay/afplay/winsound недоступны).
                         print("\a", file=sys.stderr, end="", flush=True)
             except Exception:                                    # noqa: BLE001, S110
                 pass                                             # звук — не критично
@@ -1310,8 +1390,11 @@ class RepoService:
     вывод — через callable `log`.
     """
 
-    # Кэш счётчика изменений: f"{repo}|{source}" -> (monotonic_ts, int)
+    # FIX-4.1: кэш счётчика изменений под собственным Lock. Кэш общий для
+    # класса, поэтому даже одна задача за раз не гарантирует отсутствие
+    # гонки между записью (фоновый поток) и чтением (тесты, отладка).
     _count_cache: dict = {}
+    _count_lock: threading.Lock = threading.Lock()
 
     def __init__(self,
                  git: Optional[GitRunner] = None,
@@ -2052,8 +2135,10 @@ class RepoService:
             return 0
         source = Path(str(cfg.get("source_folder", "") or "").strip())
         key = f"{repo}|{source}"
-        cached = RepoService._count_cache.get(key)
         now_ts = time.monotonic()
+        # FIX-4.1: чтение кэша под Lock.
+        with RepoService._count_lock:
+            cached = RepoService._count_cache.get(key)
         if cached and now_ts - cached[0] < CHANGE_COUNT_CACHE_TTL:
             return cached[1]
         result = 0
@@ -2080,10 +2165,20 @@ class RepoService:
                 result = max(diffs, dirty) if diffs else dirty
         except GitError:
             result = 0
-        RepoService._count_cache[key] = (now_ts, result)
+        # FIX-4.1: запись кэша под Lock.
+        with RepoService._count_lock:
+            RepoService._count_cache[key] = (now_ts, result)
         return result
 
-    count_changes.cache_clear = staticmethod(lambda: RepoService._count_cache.clear())
+    @staticmethod
+    def clear_count_cache() -> None:
+        """FIX-4.1: публичный сброс кэша счётчика.
+
+        Заменяет нестандартный приём `count_changes.cache_clear = ...`:
+        тесты и внешний код вызывают `RepoService.clear_count_cache()`.
+        """
+        with RepoService._count_lock:
+            RepoService._count_cache.clear()
 
     def reset_last(self, cfg: Any, mode: str, revert_source: bool = False) -> str:
         """Откат последнего локального коммита (ТЗ v4, задача 2.6).
@@ -2186,6 +2281,27 @@ def porcelain_plan(workdir: Path, staged: bool = False) -> tuple:
 run_git_safe = run_git                     # старый алфавитный вариант имени
 ensure_layout = ensure_repo_layout         # короткое имя той же операции
 download = download_from_repo              # репозиторий → папка
+
+
+def _reset_compat_singletons() -> None:
+    """FIX-4.7: пересоздать модульные default-инстансы.
+
+    Публичный (без ведущего «_» в имени вызова из тестов через модуль)
+    хелпер для изоляции: между тестами сбрасывает _default_git_runner,
+    _default_fs, _default_backup, _default_service и кэш счётчика.
+    """
+    global _default_git_runner, _default_fs, _default_backup, _default_service
+    global _default_notifier                        # FIX-5.11: полный сброс
+    _default_git_runner = GitRunner()
+    _default_fs = FileSync()
+    _default_backup = BackupManager()
+    _default_service = RepoService()
+    _default_notifier = Notifier()
+    # FIX-4.1: заодно чистим кэш счётчика.
+    RepoService.clear_count_cache()
+
+
+reset_compat_singletons = _reset_compat_singletons
 
 
 # --------------------------------------------------------------------------- #
@@ -2323,9 +2439,10 @@ class TaskRunner:
         except GitError as exc:
             self._queue.put(("error", str(exc)))
         except Exception as exc:                               # noqa: BLE001
-            # Полный traceback — в лог, краткая ошибка — в статус.
+            # FIX-5.9: префикс «Ошибка:» добавляет _finish — здесь его нет,
+            # иначе messagebox.showerror показывал «Ошибка: Ошибка: …».
             self._queue.put(("log", traceback.format_exc()))
-            self._queue.put(("error", f"Ошибка: {exc}"))
+            self._queue.put(("error", str(exc)))
 
     def poll(self, skip: frozenset = frozenset()) -> list[tuple[str, Any]]:
         """Неблокирующая выборка событий.
@@ -2494,6 +2611,18 @@ class MainWindow:
     """
 
     AUTO_LABELS = {"commit": "Авто-коммит", "download": "Авто-клон"}
+    # FIX-4.3: человекочитаемые метки задач для статус-строки.
+    TASK_LABELS = {
+        "commit": "коммит",
+        "download": "выгрузка",
+        "revert": "откат",
+        "tag": "тег",
+        "test-conn": "проверка связи",
+        "branches": "список веток",
+        "count": "подсчёт изменений",
+        "auto-commit": "авто-коммит",
+        "auto-download": "авто-клон",
+    }
 
     def __init__(self, root):
         self.root = root
@@ -2648,7 +2777,7 @@ class MainWindow:
 
         self.btn_commit = tk.Button(
             btn_frame,
-            text="КОММИТ",
+            text=BTN_COMMIT_TEXT,
             font=("Segoe UI", 24, "bold"),
             bg="#1f8b4c",
             fg="white",
@@ -2969,12 +3098,31 @@ class MainWindow:
                 pass
         self._settings_debounce_id = self.root.after(300, self._do_save_settings)
 
+    # FIX-5.4: ключи, влияющие на счётчик изменений. При их смене
+    # счётчик на кнопке нужно пересчитать в ближайшем цикле
+    # _maybe_count_changes.
+    _COUNT_TRIGGER_KEYS = (
+        "repository", "source_folder", "download_folder", "branch",
+        "delete_extra", "respect_gitignore", "sync_ignore_patterns",
+        "accurate_count",
+    )
+
     def _do_save_settings(self) -> None:
         self._settings_debounce_id = None
+        before = {k: self.cfg.get(k) for k in self._COUNT_TRIGGER_KEYS}
         try:
             self._collect_cfg()
         except Exception as exc:                             # noqa: BLE001
             self.log(f"Не удалось сохранить настройки: {exc}")
+            return
+        after = {k: self.cfg.get(k) for k in self._COUNT_TRIGGER_KEYS}
+        if before != after:
+            # Пересчёт произойдёт в ближайшем _maybe_count_changes.
+            self._count_dirty = True
+        # FIX-5.8: обновить префикс кнопки (КОММИТ / DRY-RUN) — флаг
+        # dry_run меняется только здесь, а сама кнопка живёт в _apply_change_count.
+        if self.change_count is not None:
+            self._apply_change_count(self.change_count)
 
     def pick_folder(self) -> None:
         folder = filedialog.askdirectory(title="Папка, откуда коммитим",
@@ -3207,12 +3355,21 @@ class MainWindow:
     #  Фоновые задачи (TaskRunner + queue)                                #
     # ================================================================== #
 
-    def _ask_in_main(self, fn: Callable[[], Any]) -> Any:
-        """FIX-2.3/2.4: выполнить fn() в главном потоке Tk и вернуть результат.
+    def _ask_in_main(self, fn: Callable[[], Any],
+                     timeout: float = 300.0) -> Any:
+        """FIX-2.3/2.4/5.3: выполнить fn() в главном потоке Tk и вернуть результат.
 
         Вызывается из фонового потока TaskRunner (RepoService.commit) и
         блокирует его до окончания диалога. Если окно уже закрыто — вернёт
         None; вызывающая сторона трактует None как «cancel».
+
+        FIX-5.3: добавлен timeout. Без него при закрытии окна в момент
+        запроса (root.destroy() до выполнения after-колбэка) фоновый поток
+        навсегда повис бы в done.wait(), а вместе с ним — процесс.
+        Компромисс: root.after вызывается из не-Tk-потока; на CPython с
+        Tcl 8.6+ это работает, но не документировано. Таймаут — минимальная
+        страховка; полный переход на очередь MainWindow._tick — отдельная
+        задача.
         """
         box: dict[str, Any] = {"value": None}
         done = threading.Event()
@@ -3229,7 +3386,11 @@ class MainWindow:
             self.root.after(0, _do)
         except tk.TclError:
             return None
-        done.wait()
+        if not done.wait(timeout=timeout):
+            _log_to_file(
+                f"UI-диалог не ответил за {timeout:.0f} с — считаем отменой.",
+                logging.WARNING)
+            return None
         return box["value"]
 
     def on_conflicts(self, conflicts: list) -> str:
@@ -3326,7 +3487,12 @@ class MainWindow:
 
         if not self.tasks.start(kind, _runner, *args):
             return False
-        self._refresh_buttons()
+        # FIX-5.5: «тихие» задачи (count/branches/test-conn) не блокируют
+        # UI — кнопки остаются активными, статус не трогаем.
+        if not quiet:
+            self._refresh_buttons()
+        # _poll_results() нужен всегда: он запускает цикл опроса очереди,
+        # который сам себя продолжает через root.after, пока busy.
         self._poll_results()
         return True
 
@@ -3357,11 +3523,15 @@ class MainWindow:
         elif self.tasks.busy:
             self.root.after(100, self._poll_results)
 
+    # FIX-5.14: единый кортеж «задачи по клику» — используется и для
+    # messagebox, и для _is_interactive, чтобы списки не разъезжались.
+    _INTERACTIVE_TASKS = ("commit", "download", "test-conn", "branches",
+                          "revert", "tag")
+
     @staticmethod
     def _is_interactive(task: Optional[str]) -> bool:
         """Задачи по клику: их ошибки показывают messagebox."""
-        return task in ("commit", "download", "test-conn", "branches",
-                        "revert", "tag")
+        return task in MainWindow._INTERACTIVE_TASKS
 
     def _finish(self, kind: str, text: Any, task: Optional[str],
                 interactive: bool) -> None:
@@ -3375,7 +3545,8 @@ class MainWindow:
                 # фоновый счётчик — молча, но помечаем к пересчёту
                 self._count_dirty = True
                 return
-            self.set_status(f"Ошибка: {task or 'задача'}")
+            label = self.TASK_LABELS.get(task, task or "задача")
+            self.set_status(f"Ошибка: {label}")
             self.log(str(text))
             if interactive and task in ("commit", "download", "revert", "tag",
                                         "test-conn"):
@@ -3416,7 +3587,10 @@ class MainWindow:
                 msg = f"Готово: {text}" if text else "Готово."
                 self.log(f"{self.AUTO_LABELS['commit' if task == 'auto-commit' else 'download']}: {msg}")
             else:
-                msg = f"Готово: {text}" if text else "Готово."
+                label = self.TASK_LABELS.get(task, task or "")
+                prefix = f"{label.capitalize()}: " if label else "Готово: "
+                msg = f"{prefix}{text}" if text else (f"{label.capitalize()}: готово"
+                                                     if label else "Готово.")
                 self.set_status(msg)
                 self.log(msg)
             if task in ("commit", "download", "revert", "auto-commit",
@@ -3483,24 +3657,43 @@ class MainWindow:
         # delete_extra=True, confirm_delete_extras=True, есть лишние файлы.
         # Список лишних берём через RepoService.preview_extras: он совпадает
         # с фактической чисткой (учитывает PROTECT_FROM_DELETE и ls-files).
+        # FIX-5.7: точный preview возможен только если локальная копия
+        # уже существует — иначе мы не знаем имён файлов репозитория и
+        # любой файл цели покажется «лишним». В этом случае показываем
+        # предупреждение о факте включённого delete_extra без списка.
+        repo_url = str(self.cfg.get("repository", "") or "").strip()
+        local = local_clone_dir(repo_url)
+        clone_ready = (local / ".git").is_dir()
+
         if (self.cfg.get("delete_extra", False)
                 and self.cfg.get("confirm_delete_extras", True)):
-            extras_preview = self.service.preview_extras(
-                self.cfg.as_dict(), target_path)
-            if extras_preview:
-                # Показываем до 20 строк, дальше — многоточие.
-                shown = "\n".join(f"  • {p.name}" for p in extras_preview[:20])
-                more = (f"\n  … и ещё {len(extras_preview) - 20}"
-                        if len(extras_preview) > 20 else "")
+            if not clone_ready:
                 if not messagebox.askyesno(
                     APP_TITLE,
-                    f"В целевой папке {len(extras_preview)} объектов, которых "
-                    "нет в репозитории. Они будут УДАЛЕНЫ "
-                    "(delete_extra=ВКЛ).\n"
-                    "Файлы репозитория будут выгружены поверх.\n\n"
-                    f"{shown}{more}\n\nПродолжить?"):
+                    "Локальной копии репозитория ещё нет — точный список "
+                    "файлов, которые будут удалены, неизвестен.\n\n"
+                    "Включён режим delete_extra: по завершении клонирования "
+                    "файлы, которых нет в репозитории, будут удалены.\n\n"
+                    "Продолжить?"):
                     self.log("Выгрузка отменена пользователем.")
                     return
+            else:
+                extras_preview = self.service.preview_extras(
+                    self.cfg.as_dict(), target_path)
+                if extras_preview:
+                    shown = "\n".join(f"  • {p.name}"
+                                      for p in extras_preview[:20])
+                    more = (f"\n  … и ещё {len(extras_preview) - 20}"
+                            if len(extras_preview) > 20 else "")
+                    if not messagebox.askyesno(
+                        APP_TITLE,
+                        f"В целевой папке {len(extras_preview)} объектов, "
+                        "которых нет в репозитории. Они будут УДАЛЕНЫ "
+                        "(delete_extra=ВКЛ).\n"
+                        "Файлы репозитория будут выгружены поверх.\n\n"
+                        f"{shown}{more}\n\nПродолжить?"):
+                        self.log("Выгрузка отменена пользователем.")
+                        return
 
         self._set_busy_status("Выгружаем из репо…")
         # confirm=None: решение принято выше; RepoService не будет спрашивать
@@ -3569,6 +3762,15 @@ class MainWindow:
         подстроке и экспорт видимых строк в CSV (utf-8-sig для Excel).
         История читается из self.cfg (единый владелец config.json).
         """
+        # FIX-5.2: история пишется из фоновых потоков через свой экземпляр
+        # Config, а self.cfg держит снимок со старта — перечитываем history
+        # с диска перед показом, иначе коммиты/выгрузки текущей сессии не
+        # видны.
+        try:
+            self.cfg.reload_history()
+        except Exception as exc:                             # noqa: BLE001
+            self.log(f"История: не удалось перечитать конфиг ({exc}).")
+
         dlg = tk.Toplevel(self.root)
         dlg.title("История операций")
         dlg.transient(self.root)
@@ -3726,10 +3928,14 @@ class MainWindow:
     def _maybe_count_changes(self) -> None:
         """Периодически (раз в ~30 с) считает git status --porcelain в фоне."""
         try:
-            if (self._count_dirty and not self.tasks.busy
-                    and is_repo_url(str(self.cfg.get("repository", "")).strip())):
-                self._count_dirty = False
-                self._start_bg("count", self.service.count_changes)
+            if self._count_dirty and not self.tasks.busy:
+                if is_repo_url(str(self.cfg.get("repository", "")).strip()):
+                    self._count_dirty = False
+                    self._start_bg("count", self.service.count_changes)
+                else:
+                    # FIX-5.13: репозиторий невалиден — сбрасываем флаг,
+                    # чтобы не перепроверять URL каждые 30 с вхолостую.
+                    self._count_dirty = False
         finally:
             self.root.after(30000, self._maybe_count_changes)
 
@@ -3739,10 +3945,12 @@ class MainWindow:
         except (TypeError, ValueError):
             n = 0
         self.change_count = n
-        base = "КОММИТ"
-        text = f"{base} ({n})" if n > 0 else base
+        # FIX-4.4: строка собирается по константам, без срезов длины.
+        suffix = f" ({n})" if n > 0 else ""
         if self.var_checks["dry_run"].get():
-            text = "DRY-RUN" + text[len(base):]
+            text = f"{BTN_DRY_RUN_PREFIX}{suffix}"
+        else:
+            text = f"{BTN_COMMIT_TEXT}{suffix}"
         self.btn_commit.configure(text=text)
 
     # ================================================================== #
@@ -3768,17 +3976,19 @@ class MainWindow:
             self.log(f"Не удалось сохранить настройки: {exc}")
 
     def _on_interval_change(self, mode) -> None:
-        """Спинбоксы интервалов: общий и индивидуальные."""
-        try:
-            self._collect_cfg()
-        except Exception as exc:                               # noqa: BLE001
-            self.log(f"Не удалось сохранить настройки: {exc}")
-            return
+        """Спинбоксы интервалов: общий и индивидуальные.
+
+        FIX-5.6: планирование таймеров делаем сразу (иначе индикатор
+        «следующий через…» отстаёт от спинбокса), а запись config.json —
+        через дебаунс _on_settings_change. Иначе стрелки ↑/↓ пишут
+        конфиг на каждое нажатие.
+        """
         for m in (("commit", "download") if mode is None else (mode,)):
             if self.scheduler.is_enabled(m):
                 self.scheduler.schedule(m, enable=False)
         self.log(f"Интервалы: общий {self.var_ai.get()} мин, "
                  f"коммит {self.var_ci.get()}, клон {self.var_cl.get()}.")
+        self._on_settings_change()
 
     def _run_auto_now(self, mode: str) -> None:
         """Кнопка «Сейчас» — немедленный запуск в фоне + перепланировка."""
@@ -4108,6 +4318,10 @@ def main() -> None:
             app.log(f"git {ver[0]}.{ver[1]} — OK")
     elif isinstance(ver, str) and ver:
         app.log(f"git: {ver}")
+    else:
+        # FIX-5.12: git найден, но версию распознать не удалось —
+        # не оставляем пользователя без единого сообщения.
+        app.log("git: версию определить не удалось.")
     root.mainloop()
 
 
