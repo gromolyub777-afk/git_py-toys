@@ -1731,7 +1731,9 @@ class RepoService:
             if conflicts:
                 # диалог конфликтов показывает GUI через on_conflicts (ТЗ 4.2)
                 handler = getattr(self, "on_conflicts", None)
-                if auto or handler is None:
+                # FIX-2.3: проверяем callable, а не только «не None» — так
+                # не поймаем случай «атрибут установлен, но не функция».
+                if auto or not callable(handler):
                     raise GitError("Merge конфликтует с изменениями коллеги: "
                                    + ", ".join(conflicts[:20]) +
                                    ("…" if len(conflicts) > 20 else "") +
@@ -2468,6 +2470,10 @@ class MainWindow:
         self.service = RepoService(git=GitRunner(), fs=FileSync(),
                                    backup=BackupManager(),
                                    notifier=self.notifier)
+        # FIX-2.3: RepoService.commit при merge-конфликтах вызывает
+        # self.on_conflicts; прокидываем его из окна. Метод маршалит
+        # диалог в главный поток (см. _ask_in_main).
+        self.service.on_conflicts = self.on_conflicts
         self.tasks = TaskRunner()
         # Очередь событий фоновых задач (log/done/error) — доступна наружу
         # под историческим именем msg_queue; владелец — TaskRunner.
@@ -2640,6 +2646,9 @@ class MainWindow:
                    command=self.on_revert_last).pack(side="left")
         ttk.Button(tools_row, text="Создать тег",
                    command=self.on_create_tag).pack(side="left", padx=(6, 0))
+        # FIX-2.2: окно истории операций (Ctrl+H).
+        ttk.Button(tools_row, text="История",
+                   command=self.on_show_history).pack(side="left", padx=(6, 0))
 
         # --- авто-режимы ------------------------------------------------------ #
         auto_frame = ttk.LabelFrame(main_frame, text="Авто-режимы", padding=8)
@@ -2798,6 +2807,15 @@ class MainWindow:
     def _wire(self):
         self._setup_validation()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
+        # FIX-2.1: горячие клавиши (см. docstring модуля).
+        # Возврат "break" не нужен: обработчики не конфликтуют с Entry.
+        self.root.bind("<Control-Return>", lambda _e: self.on_commit())
+        self.root.bind("<Control-d>", lambda _e: self.on_download())
+        self.root.bind("<Control-Shift-D>",
+                       lambda _e: self._hotkey_dry_run())
+        self.root.bind("<Control-comma>", lambda _e: self.open_config())
+        self.root.bind("<Control-h>", lambda _e: self.on_show_history())
+        self.root.bind("<F5>", lambda _e: self.on_refresh_branches())
         if self.var_watch.get():
             self._start_watcher()
 
@@ -2939,6 +2957,16 @@ class MainWindow:
             self.cfg.save()
         open_config_in_editor(path)
         self.set_status(f"Конфиг открыт: {path.name}")
+
+    def _hotkey_dry_run(self) -> None:
+        """Ctrl+Shift+D: включить dry-run и сразу запустить КОММИТ.
+
+        Флаг сохраняется в конфиг как обычное значение dry_run=True —
+        пользователь может снять его галочкой «Только показать (dry-run)».
+        """
+        self.var_checks["dry_run"].set(True)
+        self._on_settings_change()
+        self.on_commit()
 
     @staticmethod
     def _open_in_editor(path: Path) -> None:
@@ -3115,6 +3143,93 @@ class MainWindow:
     #  Фоновые задачи (TaskRunner + queue)                                #
     # ================================================================== #
 
+    def _ask_in_main(self, fn: Callable[[], Any]) -> Any:
+        """FIX-2.3/2.4: выполнить fn() в главном потоке Tk и вернуть результат.
+
+        Вызывается из фонового потока TaskRunner (RepoService.commit) и
+        блокирует его до окончания диалога. Если окно уже закрыто — вернёт
+        None; вызывающая сторона трактует None как «cancel».
+        """
+        box: dict[str, Any] = {"value": None}
+        done = threading.Event()
+
+        def _do() -> None:
+            try:
+                box["value"] = fn()
+            except Exception as exc:                       # noqa: BLE001
+                _log_to_file(f"UI-диалог упал: {exc}", logging.ERROR)
+            finally:
+                done.set()
+
+        try:
+            self.root.after(0, _do)
+        except tk.TclError:
+            return None
+        done.wait()
+        return box["value"]
+
+    def on_conflicts(self, conflicts: list) -> str:
+        """FIX-2.3: колбэк RepoService — какие файлы в конфликте.
+
+        Возвращает "continue" | "cancel"; вызывается из фонового потока.
+        """
+        return self._ask_in_main(lambda: self._conflicts_dialog(conflicts))
+
+    def _conflicts_dialog(self, conflicts: list) -> str:
+        """Модалка со списком конфликтующих файлов. Всегда в главном потоке."""
+        result = {"value": "cancel"}
+        win = tk.Toplevel(self.root)
+        win.title("Конфликты merge")
+        win.transient(self.root)
+        win.grab_set()
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm,
+                  text=f"Файлов с конфликтами: {len(conflicts)}").pack(anchor="w")
+        lst = tk.Listbox(frm, height=min(15, max(3, len(conflicts))), width=70)
+        for c in conflicts:
+            lst.insert("end", str(c))
+        lst.pack(fill="both", expand=True, pady=(6, 6))
+
+        def _ok() -> None:
+            result["value"] = "continue"
+            win.destroy()
+
+        def _cancel() -> None:
+            result["value"] = "cancel"
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Продолжить коммит", command=_ok)\
+            .pack(side="right")
+        ttk.Button(btns, text="Отменить", command=_cancel)\
+            .pack(side="right", padx=(0, 6))
+        win.protocol("WM_DELETE_WINDOW", _cancel)
+        self.root.wait_window(win)
+        return result["value"]
+
+    def on_diverged(self, behind: int) -> str:
+        """FIX-2.4: колбэк RepoService при разошедшихся историях.
+
+        Возвращает "merge" | "overwrite" | "cancel"; вызывается из фонового
+        потока. В авто-режиме не используется — там решает RepoService.
+        """
+        return self._ask_in_main(lambda: self._diverged_dialog(behind))
+
+    def _diverged_dialog(self, behind: int) -> str:
+        ans = messagebox.askyesnocancel(
+            APP_TITLE,
+            "Истории разошлись: у вас есть локальные коммиты, которых нет на "
+            f"origin.\nНа origin {behind} новых коммит(ов).\n\n"
+            "«Да»   — слить: git merge origin/<branch> (может создать merge-коммит).\n"
+            "«Нет»  — перезаписать: локальные коммиты будут потеряны "
+            "(reset --hard на origin).\n"
+            "«Отмена» — прервать коммит.")
+        if ans is None:
+            return "cancel"
+        return "merge" if ans else "overwrite"
+
     def _start_bg(self, kind: str, fn: Callable[..., Any], *args: Any) -> bool:
         """Запускает задачу в фоновом потоке. False, если уже занято.
 
@@ -3276,8 +3391,10 @@ class MainWindow:
                 "и папку-источник, затем нажмите КОММИТ.\n\n"
                 "Кнопка «…» справа внизу открывает файл config.json.")
             return
-        # dry-run ничего не пишет — можно запускать даже когда он «занят»
-        self._start_bg("commit", self.service.commit)
+        # dry-run ничего не пишет — можно запускать даже когда он «занят».
+        # FIX-2.4: прокидываем on_diverged (auto=False идёт вторым
+        # позиционным, затем колбэк).
+        self._start_bg("commit", self.service.commit, False, self.on_diverged)
 
     def on_download(self) -> None:
         if self.tasks.busy:
@@ -3372,6 +3489,77 @@ class MainWindow:
     # ================================================================== #
     #  Откат последнего коммита / теги                                    #
     # ================================================================== #
+
+    def on_show_history(self) -> None:
+        """FIX-2.2: модальное окно истории операций (Ctrl+H / «История»).
+
+        Колонки: time | type | branch | sha | message. Есть фильтр по
+        подстроке и экспорт видимых строк в CSV (utf-8-sig для Excel).
+        История читается из self.cfg (единый владелец config.json).
+        """
+        dlg = tk.Toplevel(self.root)
+        dlg.title("История операций")
+        dlg.transient(self.root)
+        dlg.geometry("760x440")
+        frm = ttk.Frame(dlg, padding=8)
+        frm.pack(fill="both", expand=True)
+
+        filter_row = ttk.Frame(frm)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text="Фильтр:").pack(side="left")
+        var_filter = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=var_filter, width=48)\
+            .pack(side="left", padx=(6, 0))
+
+        cols = ("time", "type", "branch", "sha", "message")
+        tree = ttk.Treeview(frm, columns=cols, show="headings", height=15)
+        for c, w in zip(cols, (160, 90, 110, 90, 300)):
+            tree.heading(c, text=c)
+            tree.column(c, width=w, anchor="w", stretch=(c == "message"))
+        tree.pack(fill="both", expand=True, pady=(6, 0))
+
+        # Снимок истории — чтобы фильтр не гонялся за живым Config.
+        history = [h for h in (self.cfg.get("history") or [])
+                   if isinstance(h, dict)]
+
+        def _fill() -> None:
+            tree.delete(*tree.get_children())
+            needle = var_filter.get().strip().lower()
+            # Свежие — сверху.
+            for entry in reversed(history):
+                row = {k: str(entry.get(k, "")) for k in cols}
+                if needle and needle not in " ".join(row.values()).lower():
+                    continue
+                tree.insert("", "end", values=tuple(row[c] for c in cols))
+        var_filter.trace_add("write", lambda *_a: _fill())
+        _fill()
+
+        def _export() -> None:
+            path = filedialog.asksaveasfilename(
+                parent=dlg, title="Экспорт истории в CSV",
+                defaultextension=".csv",
+                filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
+            if not path:
+                return
+            try:
+                with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow(cols)
+                    for iid in tree.get_children():
+                        w.writerow(tree.item(iid, "values"))
+                self.log(f"История экспортирована: {path}")
+                self.set_status("История экспортирована в CSV")
+            except OSError as exc:
+                messagebox.showerror(APP_TITLE,
+                                     f"Не удалось записать CSV: {exc}",
+                                     parent=dlg)
+
+        btn_row = ttk.Frame(frm)
+        btn_row.pack(fill="x", pady=(6, 0))
+        ttk.Button(btn_row, text="Экспорт в CSV", command=_export)\
+            .pack(side="right")
+        ttk.Button(btn_row, text="Закрыть", command=dlg.destroy)\
+            .pack(side="right", padx=(0, 6))
 
     def on_revert_last(self) -> None:
         if self.tasks.busy:
@@ -3542,6 +3730,8 @@ class MainWindow:
         self.scheduler.schedule(mode, enable=self.scheduler.is_enabled(mode))
         if mode == "commit":
             self.set_status("Авто-коммит: выполняем…")
+            # FIX-2.4: в авто-режиме диалог недопустим — on_diverged=None,
+            # RepoService выберет "cancel".
             return self._start_bg("auto-commit", self.service.commit, True)
         self.set_status("Авто-клон: выполняем…")
         return self._start_bg("auto-download", self.service.download, None)
