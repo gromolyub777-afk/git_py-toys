@@ -78,6 +78,91 @@ except Exception as _tk_exc:                       # noqa: BLE001
     tk = None                                      # type: ignore[assignment]
     _TK_ERROR_TEXT = str(_tk_exc)
 
+# --------------------------------------------------------------------------- #
+#  v5 (ТЗ UI/UX редизайн): необязательные зависимости                        #
+#  * sv_ttk — светлая/тёмная тема ttk; без пакета работает базовая тема clam. #
+#  * tkinterdnd2 — drag&drop папки/URL из проводника; без него TkinterDn2.Tk   #
+#    подменяется заглушкой с no-op-регистрацией — код не падает нигде.        #
+# --------------------------------------------------------------------------- #
+
+try:
+    import sv_ttk as _sv_ttk                       # type: ignore
+except Exception:                                  # noqa: BLE001
+    _sv_ttk = None
+
+try:
+    from tkinterdnd2 import TkinterDn2, DND_FILES  # type: ignore
+    _HAS_DND = True
+except Exception:                                  # noqa: BLE001
+    TkinterDn2 = None                              # type: ignore[assignment]
+    DND_FILES = "DnD"                              # type: ignore[assignment]
+    _HAS_DND = False
+
+
+def _detect_os_dark_mode() -> bool:
+    """Пытаемся определить тёмную тему ОС (Windows/macOS); Linux — registry/gsettings."""
+    try:
+        if sys.platform == "win32":
+            import winreg                          # только Windows
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+            value, _ = winreg.QueryValueEx(key, "AppsUseLightTheme")
+            winreg.CloseKey(key)
+            return int(value) == 0
+        if sys.platform == "darwin":
+            out = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=2)
+            return out.stdout.strip().lower() == "dark"
+        if sys.platform.startswith("linux"):
+            out = subprocess.run(
+                ["gsettings", "get", "org.gnome.desktop.interface",
+                 "color-scheme"],
+                capture_output=True, text=True, timeout=2)
+            return "dark" in out.stdout
+    except Exception:                              # noqa: BLE001
+        pass
+    return False
+
+
+def _dnd_register(widget, dtype: str, handler: Callable[[Any], None]) -> bool:
+    """Регистрация drop-приёмника. False, если tkinterdnd2 недоступен."""
+    if not _HAS_DND or widget is None:
+        return False
+    try:
+        widget.drop_target_register(dtype)
+        widget.dnd_bind("<<Drop>>", handler)
+        return True
+    except Exception:                              # noqa: BLE001
+        return False
+
+
+def _parse_dnd_paths(raw: str) -> list[str]:
+    """Разбор данных DnD («{path with spaces} file2») в список путей."""
+    try:
+        root = tk._default_root                      # noqa: SLF001
+        if root is not None:
+            return list(root.splitlist(raw))
+    except Exception:                                # noqa: BLE001
+        pass
+    return [p.strip("{}") for p in re.findall(r"\{[^}]*\}|[^\s]+", raw or "")]
+
+
+# v5 (ТЗ UI/UX): иконки — Unicode-эмодзи, константами, чтобы не искать по коду.
+ICON_FOLDER = "📂"
+ICON_REFRESH = "🔄"
+ICON_GEAR = "⚙️"
+ICON_CLIPBOARD = "📋"
+ICON_OK = "✅"
+ICON_FAIL = "❌"
+ICON_COMMIT = "🚀"
+ICON_DOWNLOAD = "📥"
+ICON_HISTORY = "🕘"
+ICON_TAG = "🏷"
+ICON_REVERT = "↩"
+ICON_SPINNER = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+
 # watchdog — опциональная зависимость watcher'а файлов (импорты на уровне
 # модуля, ТЗ v3.2 п.1.2; без неё UI снимает чекбокс и просит pip install).
 try:
@@ -704,6 +789,10 @@ class Config:
             "accurate_count": False,         # точный (медленный) подсчёт изменений (ТЗ 2.4)
             "sync_ignore_patterns": "",      # glob-паттерны через запятую (ТЗ 4.3)
             "skip_confirm_targets": [],      # папки выгрузки с «не показывать снова» (ТЗ 2.5)
+            # ---- v5 (ТЗ UI/UX редизайн) ----------------------------------
+            # Тема sv_ttk: auto — определять по ОС при старте,
+            # light/dark — принудительные; переключатель в «Настройках».
+            "ui_theme": "auto",
         }
 
     # ------------------------------------------------------------------ #
@@ -2534,11 +2623,55 @@ class PlaceholderEntry(_TTK_ENTRY_BASE):
 
 
 class LogPanel:
-    """Text-виджет лога с таймстампами, автоскроллом и записью в файл."""
+    """Text-виджет лога с таймстампами, автоскроллом и записью в файл.
+
+    v5 (ТЗ UI/UX, п.4): regex-подсветка — пути синие (клик → открыть
+    проводник), SHA серый моноширинный (клик → копировать в буфер),
+    fatal:/error: красный фон, успех зелёный текст.
+    """
+
+    # Пути: абсолютные unix/windows и относительные с разделителем.
+    _RE_PATH = re.compile(
+        r"(?:^|(?<=[\s:()<>\u201c\u00ab]))"
+        r"((?:[A-Za-z]:[\\/][^\s:,;)\]]+|/[^\s:,;)\][]+/[^\s:,;)\]]*))")
+    # SHA: 7–40 hex, рядом со словом sha/commit/hash или одинокий токен.
+    _RE_SHA = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{7,40})(?![0-9a-fA-F])")
+    _RE_ERROR = re.compile(r"(fatal:|error:|ERROR|Traceback)", re.IGNORECASE)
+    _RE_OK = re.compile(r"(Готово|OK\b|успешн|Успешн|Done\b)")
+    _RE_TIME = re.compile(r"^\[\d{2}:\d{2}:\d{2}\] ")
+    _MONO_FONT = ("Consolas", 8)
 
     def __init__(self, parent):
         self.text = tk.Text(parent, height=7, state="disabled", wrap="word",
                             font=("Consolas", 9))
+        t = self.text
+        base_bg = str(t.cget("background"))
+        dark = self._is_dark(base_bg)
+        t.tag_configure("path", foreground="#4f8cff" if dark else "#1565c0",
+                        underline=True)
+        t.tag_configure("sha", foreground="#8a94a6" if dark else "#607d8b",
+                        font=self._MONO_FONT)
+        t.tag_configure("errline", background="#5a1d1d" if dark else "#ffebee",
+                        foreground="#ffb3b3" if dark else "#c62828")
+        t.tag_configure("okline", foreground="#69db7c" if dark else "#2e7d32")
+        t.tag_configure("stamp", foreground="#8a94a6" if dark else "#9e9e9e")
+        t.tag_bind("path", "<Button-1>", self._on_path_click)
+        t.tag_bind("path", "<Enter>", lambda _e: t.configure(cursor="hand2"))
+        t.tag_bind("path", "<Leave>", lambda _e: t.configure(cursor=""))
+        t.tag_bind("sha", "<Button-1>", self._on_sha_click)
+        t.tag_bind("sha", "<Enter>", lambda _e: t.configure(cursor="hand2"))
+        t.tag_bind("sha", "<Leave>", lambda _e: t.configure(cursor=""))
+
+    @staticmethod
+    def _is_dark(bg: str) -> bool:
+        try:
+            c = bg.strip().lstrip("#")
+            if len(c) == 3:
+                c = "".join(ch * 2 for ch in c)
+            r, g, b = (int(c[i:i + 2], 16) for i in (0, 2, 4))
+            return (0.299 * r + 0.587 * g + 0.114 * b) < 128
+        except Exception:                          # noqa: BLE001
+            return False
 
     def pack(self, **kw: Any) -> None:
         self.text.pack(**kw)
@@ -2549,18 +2682,276 @@ class LogPanel:
     def append(self, msg: str) -> None:
         stamp = datetime.now().strftime("%H:%M:%S")
         line = f"[{stamp}] {msg}\n"
+        start = "end-1c"
         self.text.configure(state="normal")
         self.text.insert("end", line)
+        end = self.text.index("insert")
+        self.text.tag_add("stamp", start, f"{start} lineend + 1 chars")
+        self._highlight_line(start, end, msg)
         self.text.see("end")
         self.text.configure(state="disabled")
         for part in str(msg).splitlines():
             if part.strip():
                 _log_to_file(part)
 
+    def _highlight_line(self, start: str, end: str, msg: str) -> None:
+        """Раскрасить вставленную строку по regex (v5, п.4)."""
+        t = self.text
+        offset = len(t.line_start(start))  # длина префикса «[HH:MM:SS] »
+        body_start = f"{start} + {offset} chars"
+        if self._RE_ERROR.search(msg):
+            t.tag_add("errline", start, end)
+        elif self._RE_OK.search(msg):
+            t.tag_add("okline", body_start, end)
+        for m in self._RE_PATH.finditer(msg):
+            s = f"{body_start} + {m.start(1)} chars"
+            e = f"{body_start} + {m.end(1)} chars"
+            t.tag_add("path", s, e)
+        # SHA подсвечиваем только осмысленно: слово sha/commit/hex рядом,
+        # иначе любое число из 7+ цифр станет «серым моно».
+        low = msg.lower()
+        want_sha = any(w in low for w in
+                       ("sha", "commit", "хэш", "hash", "HEAD", "tag "))
+        if want_sha:
+            for m in self._RE_SHA.finditer(msg):
+                tok = m.group(1)
+                if tok.isdigit() or not re.search(r"[0-9]", tok):
+                    continue      # чисто цифровые/буквенные токены — не SHA
+                s = f"{body_start} + {m.start(1)} chars"
+                e = f"{body_start} + {m.end(1)} chars"
+                t.tag_add("sha", s, e)
+
+    # ---- клики ---------------------------------------------------------- #
+    def _token_at(self, index: str, tag: str) -> str:
+        """Текст тега под курсором (для обработчиков кликов)."""
+        t = self.text
+        ranges = [r for r in t.tag_ranges(tag)
+                  if t.compare(f"{index} >= {r[0]}", "and",
+                               f"{index} <= {r[1]}")]
+        if not ranges:
+            return ""
+        return t.get(ranges[0][0], ranges[0][1]).strip()
+
+    def _on_path_click(self, event) -> None:
+        index = self.text.index(f"@{event.x},{event.y}")
+        token = self._token_at(index, "path")
+        if not token:
+            return
+        p = Path(token).expanduser()
+        try:
+            target = p if p.is_dir() else p.parent
+            MainWindow._open_in_editor(Path(target))
+        except Exception as exc:                   # noqa: BLE001
+            _log_to_file(f"Лог: не открыть путь {token}: {exc}",
+                         logging.WARNING)
+
+    def _on_sha_click(self, event) -> None:
+        index = self.text.index(f"@{event.x},{event.y}")
+        token = self._token_at(index, "sha")
+        if not token:
+            return
+        try:
+            root = self.text.winfo_toplevel()
+            root.clipboard_clear()
+            root.clipboard_append(token)
+            root.update()
+        except tk.TclError:
+            pass
+
     def clear(self) -> None:
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.configure(state="disabled")
+
+
+# --------------------------------------------------------------------------- #
+#  v5 (ТЗ UI/UX): Toast-уведомления                                            #
+# --------------------------------------------------------------------------- #
+
+class Toast:
+    """Всплывающее уведомление внизу окна, авто-скрытие через `duration` с.
+
+    messagebox оставляем только для критических ошибок и деструктивных
+    действий; успех показывается сюда.
+    """
+
+    _COLORS = {"success": "#1f8b4c", "info": "#2b6cb0", "warn": "#b7791f",
+               "error": "#c62828"}
+
+    def __init__(self, parent: Any, text: str, kind: str = "success",
+                 duration: float = 3.0) -> None:
+        self.duration = duration
+        try:
+            pw = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            ph = parent.winfo_height()
+            pw2 = pw + parent.winfo_width()
+        except tk.TclError:
+            pw = py = pw2 = ph = 0
+        top = self.top = tk.Toplevel(parent)
+        top.wm_overrideredirect(True)             # без рамки и заголовка
+        top.wm_attributes("-topmost", True)
+        color = self._COLORS.get(kind, self._COLORS["info"])
+        frm = tk.Frame(top, bg=color, padx=14, pady=8)
+        frm.pack(fill="both", expand=True)
+        tk.Label(frm, text=text, bg=color, fg="white",
+                 font=("Segoe UI", 10, "bold"), wraplength=420,
+                 justify="left").pack()
+        top.update_idletasks()
+        w = max(top.winfo_reqwidth(), 240)
+        h = top.winfo_reqheight()
+        x = pw + (pw2 - pw) // 2 - w // 2
+        y = py + ph - h - 24
+        top.wm_geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        top.bind("<Button-1>", lambda _e: self.close())
+        self._after = top.after(int(duration * 1000), self.close)
+
+    def close(self) -> None:
+        try:
+            if getattr(self, "_after", None):
+                self.top.after_cancel(self._after)
+                self._after = None
+            self.top.destroy()
+        except tk.TclError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+#  v5 (ТЗ UI/UX): акцентная кнопка (крупная КОММИТ/ВЫГРУЗИТЬ + полосатый      #
+#  PREVIEW-стиль в dry-run)                                                    #
+# --------------------------------------------------------------------------- #
+
+class AccentButton(tk.Canvas):
+    """Canvas-кнопка: скруглённый прямоугольник, иконка+текст, hover/press.
+
+    Полосатый стиль (`striped=True`) — визуальный бейдж PREVIEW для dry-run:
+        диагональные полосы поверх фона, как «строительная лента».
+    """
+
+    def __init__(self, master, text="", icon="", command=None,
+                 bg="#1f8b4c", fg="white", font=None, height=72,
+                 striped=False, **_kw: Any) -> None:
+        super().__init__(master, height=height, highlightthickness=0, bd=0)
+        self.command = command
+        self.bg = bg
+        self.fg = fg
+        self.disabled_bg = "#9e9e9e"
+        self.hover_delta = 18
+        self.text = text
+        self.icon = icon
+        self.font = font or ("Segoe UI", 20, "bold")
+        self.striped = striped
+        self._state = "normal"
+        self._bind_id = None
+        self.bind("<Configure>", lambda _e: self.redraw())
+        self.bind("<Enter>", self._on_enter)
+        self.bind("<Leave>", self._on_leave)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self.redraw()
+
+    # ---- API ------------------------------------------------------------- #
+    def set_text(self, text: str) -> None:
+        self.text = text
+        self.redraw()
+
+    def set_state(self, state: str) -> None:
+        """state: 'normal' | 'disabled'."""
+        if state != self._state:
+            self._state = state
+            self.redraw()
+
+    def configure_btn(self, text: Optional[str] = None,
+                      state: Optional[str] = None,
+                      striped: Optional[bool] = None,
+                      bg: Optional[str] = None) -> None:
+        if text is not None:
+            self.text = text
+        if state is not None:
+            self._state = state
+        if striped is not None:
+            self.striped = striped
+        if bg is not None:
+            self.bg = bg
+        self.redraw()
+
+    def cget(self, key: str) -> Any:      # совместимость со старым кодом
+        if key == "text":
+            return self.text
+        if key == "state":
+            return self._state
+        if key == "bg":
+            return self.bg
+        return super().cget(key)
+
+    # ---- внутреннее ------------------------------------------------------ #
+    def _shade(self, hexcolor: str, delta: int) -> str:
+        try:
+            c = hexcolor.lstrip("#")
+            r, g, b = (max(0, min(255, int(c[i:i + 2], 16) + delta))
+                       for i in (0, 2, 4))
+            return f"#{r:02x}{g:02x}{b:02x}"
+        except Exception:                          # noqa: BLE001
+            return hexcolor
+
+    def _current_bg(self) -> str:
+        if self._state == "disabled":
+            return self.disabled_bg
+        if getattr(self, "_pressed", False):
+            return self._shade(self.bg, -25)
+        if getattr(self, "_hover", False):
+            return self._shade(self.bg, self.hover_delta)
+        return self.bg
+
+    def redraw(self) -> None:
+        self.delete("all")
+        w = max(self.winfo_width(), 10)
+        h = max(self.winfo_height(), 10)
+        r = min(12, h // 3)
+        color = self._current_bg()
+        # скруглённый прямоугольник: овалы по углам + два прямоугольника
+        self.create_rectangle(r, 0, w - r, h, fill=color, outline="")
+        self.create_rectangle(0, 0, w, h, fill="", outline="")
+        self.create_rectangle(0, r, w, h - r, fill=color, outline="")
+        for cx, cy in ((r, r), (w - r - 1, r), (r, h - r - 1),
+                       (w - r - 1, h - r - 1)):
+            self.create_oval(cx - r, cy - r, cx + r + 1, cy + r + 1,
+                             fill=color, outline="")
+        if self._state == "disabled":
+            self.create_rectangle(0, 0, w, h, fill="", outline="", dash=(2, 3))
+        # полосатый PREVIEW: диагональные полупрозрачные полосы
+        if self.striped and self._state != "disabled":
+            stripe = self._shade(color, 30)
+            step = 26
+            for x in range(-h, w + h, step):
+                self.create_line(x, h, x + h, 0, fill=stripe, width=7)
+        label = f"{self.icon} {self.text}".strip() if self.icon else self.text
+        self.create_text(w // 2, h // 2, text=label, fill=self.fg,
+                         font=self.font)
+
+    def _on_enter(self, _e):
+        if self._state != "disabled":
+            self._hover = True
+            self.redraw()
+
+    def _on_leave(self, _e):
+        self._hover = False
+        self._pressed = False
+        self.redraw()
+
+    def _on_press(self, _e):
+        if self._state != "disabled":
+            self._pressed = True
+            self.redraw()
+
+    def _on_release(self, e):
+        was_pressed = getattr(self, "_pressed", False)
+        self._pressed = False
+        self.redraw()
+        if (self._state != "disabled" and was_pressed and self.command
+                and 0 <= e.x <= self.winfo_width()
+                and 0 <= e.y <= self.winfo_height()):
+            self.command()
 
 
 class ToolTip:
@@ -2670,19 +3061,24 @@ class MainWindow:
     # ================================================================== #
 
     def _build_ui(self):
+        """v5 (ТЗ UI/UX редизайн): вкладки Главная | История | Настройки,
+        тема sv_ttk, акцентные кнопки, accordion «Авто-режимы», empty state,
+        drag&drop полей, статус-бар со спиннером и прогресс-баром."""
         root = self.root
         cfg = self.cfg
         root.title(APP_TITLE)
         root.resizable(True, True)
-        root.minsize(480, 460)
+        root.minsize(560, 520)
 
+        # --- тема ---------------------------------------------------------- #
         style = ttk.Style(root)
         try:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        self._apply_theme(str(cfg.get("ui_theme", "auto")))
 
-        main_frame = ttk.Frame(root, padding=14)
+        main_frame = ttk.Frame(root, padding=10)
         main_frame.pack(fill="both", expand=True)
 
         def _g(widget, **kw):
@@ -2695,34 +3091,76 @@ class MainWindow:
             widget.pack(**kw)
             return widget
 
-        # --- верхняя строка: пути + кнопки "…" ----------------------------- #
-        top = ttk.Frame(main_frame)
+        # ================= ВКЛАДКИ (v5, ТЗ п.2) ============================ #
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.pack(fill="both", expand=True)
+        tab_main = ttk.Frame(self.notebook, padding=8)
+        tab_hist = ttk.Frame(self.notebook, padding=8)
+        tab_cfg = ttk.Frame(self.notebook, padding=8)
+        self.notebook.add(tab_main, text="🏠 Главная")
+        self.notebook.add(tab_hist, text=f"{ICON_HISTORY} История")
+        self.notebook.add(tab_cfg, text=f"{ICON_GEAR} Настройки")
+        self.tab_main, self.tab_hist, self.tab_cfg = (tab_main, tab_hist,
+                                                      tab_cfg)
+
+        # ================= ТАБ «ГЛАВНАЯ» =================================== #
+        # --- Empty State: путь/ссылка не заданы ---------------------------- #
+        self.empty_state = ttk.Frame(tab_main)
+        ttk.Label(self.empty_state, text="📭",
+                  font=("Segoe UI", 42)).pack(pady=(30, 10))
+        ttk.Label(self.empty_state,
+                  text="Укажите папку и ссылку репо",
+                  font=("Segoe UI", 14, "bold")).pack()
+        ttk.Label(self.empty_state,
+                  text="Перетащите папку из проводника в поле «Папка»\n"
+                       "или URL из браузера в поле «Ссылка репо» — "
+                       "либо откройте «Настройки».",
+                  justify="center").pack(pady=(8, 14))
+        ttk.Button(self.empty_state,
+                   text=f"{ICON_GEAR} Открыть настройки",
+                   command=lambda: self.notebook.select(2)).pack()
+
+        # лог последних действий — внизу главной, под панелью содержимого
+        self.log_panel = LogPanel(tab_main)
+        _p(self.log_panel.text, side="bottom", fill="x", pady=(10, 0))
+        self._w_log = self.log_panel.text
+
+        # рабочая панель главной (pack/unpack при empty-state)
+        home = self.home = ttk.Frame(tab_main)
+
+        # верхняя строка: пути + кнопки-иконки ------------------------------ #
+        top = ttk.Frame(home)
         top.pack(fill="x")
 
-        self._w_folder_label = _g(ttk.Label(top, text="Папка:"),
+        self._w_folder_label = _g(ttk.Label(top, text=f"{ICON_FOLDER} Папка:"),
                                   row=0, column=0, sticky="w")
         self.var_folder = tk.StringVar(value=cfg.get("source_folder", ""))
         self._w_folder = _g(ttk.Entry(top, textvariable=self.var_folder),
                             row=0, column=1, sticky="ew", padx=(6, 2))
-        self._w_folder_btn = _g(ttk.Button(top, text="…", width=3,
+        self._w_folder_ic = _g(ttk.Label(top, text="", width=2),
+                               row=0, column=2, sticky="w")
+        self._w_folder_btn = _g(ttk.Button(top, text=ICON_FOLDER, width=3,
                                            command=self.pick_folder),
-                                row=0, column=2)
+                                row=0, column=3)
 
-        self._w_repo_label = _g(ttk.Label(top, text="Ссылка репо:"),
+        self._w_repo_label = _g(ttk.Label(top, text=f"{ICON_CLIPBOARD} Ссылка репо:"),
                                 row=1, column=0, sticky="w", pady=(6, 0))
         self.var_repo = PlaceholderEntry(top, placeholder="https://github.com/user/repo.git")
         if cfg.get("repository"):
             self.var_repo.set(cfg.get("repository"))
         self._w_repo = self.var_repo
         _g(self.var_repo, row=1, column=1, sticky="ew", padx=(6, 2), pady=(6, 0))
-        self._w_repo_btn = _g(ttk.Button(top, text="…", width=3,
+        self._w_repo_ic = _g(ttk.Label(top, text="", width=2),
+                             row=1, column=2, sticky="w", pady=(6, 0))
+        self._w_repo_btn = _g(ttk.Button(top, text=ICON_CLIPBOARD, width=3,
                                          command=self.paste_repo_url),
-                              row=1, column=2, pady=(6, 0))
+                              row=1, column=3, pady=(6, 0))
 
-        # Тест соединения + таймаут сетевых операций — под полем репо
-        self._w_tools_row = _g(ttk.Frame(top), row=2, column=1, columnspan=2,
+        # Тест соединения + таймаут сетевых операций — под полем репо ------- #
+        self._w_tools_row = _g(ttk.Frame(top), row=2, column=1, columnspan=3,
                                sticky="w", pady=(4, 0))
-        self.btn_test_conn = ttk.Button(self._w_tools_row, text="Тест соединения",
+        self.btn_test_conn = ttk.Button(self._w_tools_row,
+                                        text="🔌 Тест соединения",
                                         command=self.on_test_connection)
         self.btn_test_conn.pack(side="left")
         ttk.Label(self._w_tools_row, text="  Таймаут, мин:").pack(side="left")
@@ -2738,20 +3176,23 @@ class MainWindow:
         self.var_download = tk.StringVar(value=cfg.get("download_folder", ""))
         self._w_download = _g(ttk.Entry(top, textvariable=self.var_download),
                               row=3, column=1, sticky="ew", padx=(6, 2), pady=(6, 0))
-        self._w_download_btn = _g(ttk.Button(top, text="…", width=3,
+        self._w_download_ic = _g(ttk.Label(top, text="", width=2),
+                                 row=3, column=2, sticky="w", pady=(6, 0))
+        self._w_download_btn = _g(ttk.Button(top, text=ICON_FOLDER, width=3,
                                              command=self.pick_download_folder),
-                                  row=3, column=2, pady=(6, 0))
+                                  row=3, column=3, pady=(6, 0))
 
-        # --- доп. поля: ветка (combobox) / сообщение / push ----------------- #
+        # --- доп. поля: ветка (combobox) / сообщение / push ---------------- #
         self.var_branch = tk.StringVar(value=cfg.get("branch", "main"))
         self._w_branch_label = _g(ttk.Label(top, text="Ветка:"),
                                   row=4, column=0, sticky="w", pady=(6, 0))
-        self._w_branch_row = _g(ttk.Frame(top), row=4, column=1, columnspan=2,
+        self._w_branch_row = _g(ttk.Frame(top), row=4, column=1, columnspan=3,
                                 sticky="ew", padx=(6, 0), pady=(6, 0))
         self.cmb_branch = ttk.Combobox(self._w_branch_row, textvariable=self.var_branch,
                                        values=[], width=16)
         self.cmb_branch.pack(side="left")
-        self.btn_branches = ttk.Button(self._w_branch_row, text="Обновить", width=9,
+        self.btn_branches = ttk.Button(self._w_branch_row,
+                                       text=f"{ICON_REFRESH} Обновить", width=11,
                                        command=self.on_refresh_branches)
         self.btn_branches.pack(side="left", padx=(4, 0))
 
@@ -2759,7 +3200,7 @@ class MainWindow:
         self._w_message_label = _g(ttk.Label(top, text="Сообщение:"),
                                    row=5, column=0, sticky="w", pady=(6, 0))
         self._w_message = _g(ttk.Entry(top, textvariable=self.var_message),
-                             row=5, column=1, columnspan=2, sticky="ew",
+                             row=5, column=1, columnspan=3, sticky="ew",
                              padx=(6, 0), pady=(6, 0))
 
         self.var_push = tk.BooleanVar(value=bool(cfg.get("push")))
@@ -2770,53 +3211,76 @@ class MainWindow:
 
         top.columnconfigure(1, weight=1)
 
-        # --- большая кнопка КОММИТ ------------------------------------------ #
-        btn_frame = ttk.Frame(main_frame)
+        # --- большая акцентная кнопка КОММИТ (+ бейдж PREVIEW) -------------- #
+        btn_frame = ttk.Frame(home)
         btn_frame.pack(fill="both", expand=True, pady=(14, 7))
 
-        self.btn_commit = tk.Button(
+        self.commit_badge = ttk.Label(btn_frame, text="PREVIEW",
+                                      foreground="#b7791f",
+                                      font=("Segoe UI", 9, "bold"))
+
+        self.btn_commit = AccentButton(
             btn_frame,
             text=BTN_COMMIT_TEXT,
-            font=("Segoe UI", 24, "bold"),
+            icon=ICON_COMMIT,
             bg="#1f8b4c",
             fg="white",
-            activebackground="#17703d",
-            activeforeground="white",
-            relief="flat",
-            cursor="hand2",
+            font=("Segoe UI", 22, "bold"),
+            height=84,
             command=self.on_commit,
         )
         self.btn_commit.pack(fill="both", expand=True)
+        self.commit_badge.place(in_=self.btn_commit, relx=1.0, rely=0.0,
+                                anchor="ne", x=-10, y=6)
 
-        # --- кнопка ВЫГРУЗИТЬ ИЗ РЕПО + доп. git-действия -------------------- #
-        self.btn_download = tk.Button(
-            main_frame,
+        # --- кнопка ВЫГРУЗИТЬ ИЗ РЕПО (акцентная, помельче) ----------------- #
+        self.btn_download = AccentButton(
+            home,
             text="ВЫГРУЗИТЬ ИЗ РЕПО",
-            font=("Segoe UI", 12, "bold"),
+            icon=ICON_DOWNLOAD,
             bg="#2b6cb0",
             fg="white",
-            activebackground="#22558c",
-            activeforeground="white",
-            relief="flat",
-            cursor="hand2",
+            font=("Segoe UI", 13, "bold"),
+            height=44,
             command=self.on_download,
         )
         _p(self.btn_download, fill="x", pady=(0, 7))
 
-        tools_row = ttk.Frame(main_frame)
+        # --- тулбар мелких git-действий ------------------------------------- #
+        tools_row = ttk.Frame(home)
         _p(tools_row, fill="x")
         self._w_tools_git = tools_row
-        ttk.Button(tools_row, text="Откатить последний",
+        ttk.Button(tools_row, text=f"{ICON_REVERT} Откатить",
                    command=self.on_revert_last).pack(side="left")
-        ttk.Button(tools_row, text="Создать тег",
+        ttk.Button(tools_row, text=f"{ICON_TAG} Тег",
                    command=self.on_create_tag).pack(side="left", padx=(6, 0))
-        # FIX-2.2: окно истории операций (Ctrl+H).
-        ttk.Button(tools_row, text="История",
+        # FIX-2.2: окно истории операций (Ctrl+H) — теперь ведёт на вкладку.
+        ttk.Button(tools_row, text=f"{ICON_HISTORY} История",
                    command=self.on_show_history).pack(side="left", padx=(6, 0))
 
-        # --- авто-режимы ------------------------------------------------------ #
-        auto_frame = ttk.LabelFrame(main_frame, text="Авто-режимы", padding=8)
-        auto_frame.pack(fill="x", pady=(7, 0))
+        # --- тогглер авто-коммита + таймер (главная, ТЗ п.2) ---------------- #
+        quick_auto = ttk.Frame(home)
+        _p(quick_auto, fill="x", pady=(8, 0))
+        ttk.Checkbutton(quick_auto, text="⏱ Авто-коммит",
+                        variable=self.var_auto_commit_pre,
+                        command=lambda: self._quick_toggle_auto()).pack(side="left")
+        self.lbl_next_main = ttk.Label(quick_auto, text="", width=26)
+        self.lbl_next_main.pack(side="right")
+
+        # ================= ТАБ «НАСТРОЙКИ» ================================= #
+        settings_scrollable = tab_cfg
+
+        # --- Accordion «Авто-режимы и расписание» (ТЗ п.2) ------------------ #
+        self.auto_acc_closed = False
+        self.auto_acc_header = ttk.Button(
+            settings_scrollable,
+            text="▼ ⏱ Авто-режимы и расписание",
+            command=self._toggle_auto_accordion)
+        self.auto_acc_header.pack(fill="x")
+        auto_frame = ttk.Labelframe(settings_scrollable, text="Авто-режимы",
+                                    padding=8)
+        auto_frame.pack(fill="x", pady=(2, 0))
+        self.auto_frame = auto_frame
 
         self.var_auto_commit = tk.BooleanVar(value=bool(cfg.get("auto_commit")))
         self.var_auto_clone = tk.BooleanVar(value=bool(cfg.get("auto_clone")))
@@ -2890,7 +3354,7 @@ class MainWindow:
 
         # Расписание авто-задач
         sched = cfg.get("auto_schedule", Config.defaults()["auto_schedule"])
-        sched_frame = ttk.LabelFrame(auto_frame, text="Расписание", padding=6)
+        sched_frame = ttk.Labelframe(auto_frame, text="Расписание", padding=6)
         sched_frame.grid(row=4, column=0, columnspan=5, sticky="ew", pady=(6, 0))
         self.var_sched = tk.BooleanVar(value=bool(sched.get("enabled")))
         ttk.Checkbutton(sched_frame, text="включено", variable=self.var_sched,
@@ -2918,7 +3382,8 @@ class MainWindow:
         auto_frame.columnconfigure(1, weight=1)
 
         # --- блок чекбоксов безопасности/вида ------------------------------- #
-        self._w_checks = _p(ttk.LabelFrame(main_frame, text="Режимы", padding=8),
+        self._w_checks = _p(ttk.Labelframe(settings_scrollable, text="Режимы",
+                                           padding=8),
                             fill="x", pady=(7, 0))
         grid_checks = [
             ("dry_run", "Только показать (dry-run)"),
@@ -2933,22 +3398,85 @@ class MainWindow:
             ttk.Checkbutton(self._w_checks, text=label, variable=var_cb,
                             command=self._on_settings_change)\
                 .grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=2)
+        # dry-run меняет облик кнопки КОММИТ — обновляем бейдж сразу
+        self.var_checks["dry_run"].trace_add(
+            "write", lambda *_a: self._update_preview_badge())
 
-        # --- нижняя строка: статус + маленькая кнопка "..." (открыть конфиг) #
+        # --- внешний вид: переключатель темы (ТЗ п.1) ----------------------- #
+        look = _p(ttk.Labelframe(settings_scrollable, text="Внешний вид",
+                                 padding=8),
+                  fill="x", pady=(7, 0))
+        ttk.Label(look, text="Тема:").grid(row=0, column=0, sticky="w")
+        self.var_theme = tk.StringVar(value=str(cfg.get("ui_theme", "auto")))
+        self.cmb_theme = ttk.Combobox(
+            look, textvariable=self.var_theme, width=10, state="readonly",
+            values=["auto", "light", "dark"])
+        self.cmb_theme.grid(row=0, column=1, padx=(6, 0))
+        self.cmb_theme.bind("<<ComboboxSelected>>",
+                            lambda _e: self._on_theme_switch())
+        ToolTip(self.cmb_theme).set(
+            "auto — определять по ОС при старте; light/dark — принудительно")
+
+        # ================= ТАБ «ИСТОРИЯ» (ТЗ п.4) =========================== #
+        hist_frm = tab_hist
+        filter_row = ttk.Frame(hist_frm)
+        filter_row.pack(fill="x")
+        ttk.Label(filter_row, text=f"{ICON_CLIPBOARD} Фильтр:").pack(side="left")
+        self.var_hist_filter = tk.StringVar()
+        ttk.Entry(filter_row, textvariable=self.var_hist_filter, width=40)\
+            .pack(side="left", padx=(6, 0))
+        self.btn_hist_export = ttk.Button(filter_row, text="Экспорт CSV",
+                                          command=self._hist_export)
+        self.btn_hist_export.pack(side="right")
+
+        self.hist_tree = ttk.Treeview(
+            hist_frm, columns=("time", "type", "branch", "sha", "message"),
+            show="tree headings", height=14)
+        self.hist_tree.heading("#0", text="Дата", anchor="w")
+        self.hist_tree.column("#0", width=110, anchor="w", stretch=False)
+        for c, title, wdt in (("time", "Время", 70), ("type", "Тип", 90),
+                              ("branch", "Ветка", 110), ("sha", "SHA", 90),
+                              ("message", "Сообщение", 300)):
+            self.hist_tree.heading(c, text=title, anchor="w",
+                                   command=lambda col=c: self._hist_sort(col))
+            self.hist_tree.column(c, width=wdt, anchor="w",
+                                  stretch=(c == "message"))
+        self.hist_tree.pack(fill="both", expand=True, pady=(6, 0))
+        self._hist_data: list[dict] = []
+        self._hist_sort_key = None
+        self._hist_sort_desc = False
+        self.var_hist_filter.trace_add("write",
+                                       lambda *_a: self._refresh_history_tab())
+        self.hist_tree.bind("<Double-1>", self._on_hist_sha_copy)
+        self.hist_tree.bind("<Button-3>", self._on_hist_popup)
+        self._hist_menu = tk.Menu(self.root, tearoff=0)
+        self._hist_menu.add_command(label="Скопировать SHA",
+                                    command=self._hist_copy_sha)
+        self._hist_menu.add_command(label="Откатить последний коммит",
+                                    command=self.on_revert_last)
+        self._hist_menu.add_command(label="Открыть репо в браувере",
+                                    command=self._hist_open_repo)
+        self._hist_selected_iid = None
+
+        # --- нижняя строка: спиннер + прогресс + статус + «…» --------------- #
         bottom = ttk.Frame(main_frame)
-        bottom.pack(fill="x", pady=(10, 0))
+        bottom.pack(fill="x", pady=(8, 0))
+
+        self.spinner_lbl = ttk.Label(bottom, text="", width=2,
+                                     font=("Consolas", 10))
+        self.spinner_lbl.pack(side="left")
 
         self.var_status = tk.StringVar(value="Готов.")
         ttk.Label(bottom, textvariable=self.var_status,
                   foreground="#555").pack(side="left", fill="x", expand=True)
 
-        ttk.Button(bottom, text="…", width=4,
-                   command=self.open_config).pack(side="right")
+        # v5 (ТЗ п.3): indeterminate-прогресс для clone/push
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate",
+                                        length=120)
+        self.progress.pack(side="right", padx=(6, 0))
 
-        # лог последних действий
-        self.log_panel = LogPanel(main_frame)
-        _p(self.log_panel.text, fill="x", pady=(10, 0))
-        self._w_log = self.log_panel.text
+        ttk.Button(bottom, text=ICON_GEAR, width=4,
+                   command=self.open_config).pack(side="right")
 
         # контекстные меню на полях ввода (ПКМ)
         self._entry_menu = self._build_entry_menu()
@@ -2964,6 +3492,303 @@ class MainWindow:
             # ПКМ: Windows/Linux — Button-3; macOS — Button-2 или Ctrl+ЛКМ
             for seq in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
                 w.bind(seq, self._show_entry_menu)
+
+        # v5: drag&drop папок/URL в поля путей
+        self._setup_dnd()
+
+        # v5: первичное состояние empty-state / рабочей панели
+        self._last_empty_shown = None
+        self._refresh_home_visibility()
+        self._update_preview_badge()
+        self._refresh_history_tab()
+
+    # ================================================================== #
+    #  v5: тема, accordion, empty state, dnd, toast, спиннер             #
+    # ================================================================== #
+
+    def _apply_theme(self, mode: str) -> None:
+        """sv_ttk с авто-детектом тёмной/светлой темы ОС; без пакета — clam."""
+        if _sv_ttk is None:
+            return
+        if mode == "auto":
+            mode = "dark" if _detect_os_dark_mode() else "light"
+        try:
+            _sv_ttk.set_theme(mode)
+        except Exception as exc:                             # noqa: BLE001
+            _log_to_file(f"Тема sv_ttk не применилась: {exc}", logging.WARNING)
+
+    def _on_theme_switch(self) -> None:
+        self.cfg.set("ui_theme", self.var_theme.get())
+        self._apply_theme(self.var_theme.get())
+        self.log(f"Тема: {self.var_theme.get()}.")
+        self._on_settings_change()
+
+    def _toggle_auto_accordion(self) -> None:
+        """Accordion «Авто-режимы»: стрелка ▼/▶ + сворачивание содержимого."""
+        self.auto_acc_closed = not self.auto_acc_closed
+        if self.auto_acc_closed:
+            self.auto_frame.pack_forget()
+            self.auto_acc_header.configure(text="▶ ⏱ Авто-режимы и расписание")
+        else:
+            self.auto_frame.pack(fill="x", pady=(2, 0),
+                                 after=self.auto_acc_header)
+            self.auto_acc_header.configure(text="▼ ⏱ Авто-режимы и расписание")
+
+    def _refresh_home_visibility(self) -> None:
+        """Empty State ↔ рабочая панель: если папка и ссылка не заданы —
+        показываем заглушку вместо неактивных элементов (ТЗ п.2)."""
+        folder_ok = bool(self.var_folder.get().strip())
+        repo_ok = is_repo_url(self.var_repo.get().strip())
+        ready = folder_ok and repo_ok
+        if ready == self._last_empty_shown:
+            return
+        self._last_empty_shown = ready
+        if ready:
+            self.empty_state.pack_forget()
+            self.home.pack(fill="both", expand=True,
+                           before=self.log_panel.text)
+        else:
+            self.home.pack_forget()
+            self.empty_state.pack(fill="both", expand=True,
+                                  before=self.log_panel.text)
+
+    def _quick_toggle_auto(self) -> None:
+        """Тогглер авто-коммита на главной синхронизирует чекбокс настроек."""
+        self.var_auto_commit.set(bool(self.var_auto_commit_pre.get()))
+        self._toggle_auto("commit")
+
+    def _setup_dnd(self) -> None:
+        """Drag&Drop: папка из проводника → «Папка»/«Папка выгрузки»,
+        URL из браузера → «Ссылка репо» (ТЗ п.2). Без tkinterdnd2 — no-op."""
+        targets = (
+            (self._w_folder, "folder"),
+            (self._w_download, "download"),
+            (self.var_repo, "repo"),
+        )
+        registered = 0
+        for widget, kind in targets:
+            if _dnd_register(widget, DND_FILES,
+                             lambda ev, k=kind: self._on_drop(k, ev)):
+                registered += 1
+        self._dnd_active = registered > 0
+        if registered:
+            self.log("Drag&Drop включён: перетащите папку в «Папку», "
+                     "URL — в «Ссылку репо».")
+
+    def _on_drop(self, kind: str, event: Any) -> None:
+        raw = getattr(event, "data", "") or ""
+        if kind == "repo":
+            token = raw.strip().strip("{}")
+            first = token.split()[0] if token else ""
+            value = first if is_repo_url(first) else token
+            self.var_repo.set(value)
+            self._validate_field("repo")
+        else:
+            paths = _parse_dnd_paths(raw)
+            p = Path(paths[0]).expanduser() if paths else None
+            if p is not None:
+                target = p if p.is_dir() else p.parent
+                if kind == "folder":
+                    self.var_folder.set(str(target))
+                    self._validate_field("folder")
+                else:
+                    self.var_download.set(str(target))
+                    self._validate_field("download")
+        self._refresh_home_visibility()
+        self._on_settings_change()
+
+    def _toast(self, text: str, kind: str = "success") -> None:
+        """v5 (ТЗ п.3): всплывающее уведомление внизу окна на 3 секунды."""
+        try:
+            Toast(self.root, text, kind=kind, duration=3.0)
+        except tk.TclError:
+            pass
+
+    def _update_preview_badge(self) -> None:
+        """v5 (ТЗ п.5): бейдж PREVIEW и полосатый стиль кнопки КОММИТ."""
+        try:
+            dry = bool(self.var_checks["dry_run"].get())
+        except KeyError:
+            dry = bool(self.cfg.get("dry_run"))
+        self.btn_commit.configure_btn(striped=dry)
+        if dry:
+            self.commit_badge.place(in_=self.btn_commit, relx=1.0, rely=0.0,
+                                    anchor="ne", x=-10, y=6)
+        else:
+            self.commit_badge.place_forget()
+
+    def _start_progress(self, active: bool) -> None:
+        """v5 (ТЗ п.3): indeterminate-прогресс + спиннер в статус-баре."""
+        try:
+            if active:
+                self.progress.start(12)
+                self._spinner_start()
+            else:
+                self.progress.stop()
+                self._spinner_stop()
+        except tk.TclError:
+            pass
+
+    def _spinner_stop(self) -> None:
+        sid = getattr(self, "_spinner_after", None)
+        if sid:
+            try:
+                self.root.after_cancel(sid)
+            except tk.TclError:
+                pass
+            self._spinner_after = None
+        try:
+            self.spinner_lbl.configure(text="")
+        except tk.TclError:
+            pass
+
+    def _spinner_start(self) -> None:
+        self._spinner_stop()
+        self._spinner_idx = 0
+
+        def _step():
+            self._spinner_idx = (self._spinner_idx + 1) % len(ICON_SPINNER)
+            try:
+                self.spinner_lbl.configure(text=ICON_SPINNER[self._spinner_idx])
+            except tk.TclError:
+                return
+            self._spinner_after = self.root.after(100, _step)
+        self._spinner_after = self.root.after(100, _step)
+
+    # ================================================================== #
+    #  v5: вкладка «История» — сортировка, группы дат, контекст-меню      #
+    # ================================================================== #
+
+    def _refresh_history_tab(self) -> None:
+        """Перезаполнение вкладки «История»: группировка по датам, фильтр."""
+        tree = getattr(self, "hist_tree", None)
+        if tree is None:
+            return
+        try:
+            self.cfg.reload_history()
+        except Exception:                                    # noqa: BLE001
+            pass
+        needle = self.var_hist_filter.get().strip().lower()
+        rows = [h for h in (self.cfg.get("history") or [])
+                if isinstance(h, dict)]
+        key = self._hist_sort_key or "time"
+        reverse = bool(self._hist_sort_desc)
+        if self._hist_sort_key:
+            rows.sort(key=lambda h: str(h.get(key, "")), reverse=reverse)
+        else:
+            rows.reverse()          # свежие сверху (дефолт)
+        tree.delete(*tree.get_children())
+        groups: dict[str, str] = {}
+        for entry in rows:
+            row_vals = {k: str(entry.get(k, ""))
+                        for k in ("time", "type", "branch", "sha", "message")}
+            if needle and needle not in " ".join(row_vals.values()).lower():
+                continue
+            stamp = row_vals["time"]
+            date_part = stamp[:10] if len(stamp) >= 10 else "—"
+            time_part = stamp[11:16] if len(stamp) >= 16 else stamp
+            if date_part not in groups:
+                gid = tree.insert("", "end", text=date_part, open=True,
+                                  tags=("day",))
+                groups[date_part] = gid
+            tree.insert(groups[date_part], "end",
+                        values=(time_part, row_vals["type"],
+                                row_vals["branch"], row_vals["sha"],
+                                row_vals["message"]))
+
+    def _hist_sort(self, col: str) -> None:
+        """Клик по заголовку колонки — сортировка (ТЗ п.4)."""
+        if self._hist_sort_key == col:
+            self._hist_sort_desc = not self._hist_sort_desc
+        else:
+            self._hist_sort_key = col
+            self._hist_sort_desc = False
+        self._refresh_history_tab()
+
+    def _hist_row_values(self, iid: str) -> tuple:
+        vals = self.hist_tree.item(iid, "values")
+        return tuple(vals) if vals else ()
+
+    def _on_hist_sha_copy(self, event) -> None:
+        iid = self.hist_tree.identify_row(event.y)
+        if not iid:
+            return
+        vals = self._hist_row_values(iid)
+        sha = str(vals[3]) if len(vals) > 3 else ""
+        if sha:
+            self._copy_to_clipboard(sha)
+            self._toast(f"SHA {sha} скопирован", "info")
+
+    def _on_hist_popup(self, event) -> None:
+        iid = self.hist_tree.identify_row(event.y)
+        if not iid:
+            return
+        self.hist_tree.selection_set(iid)
+        self._hist_selected_iid = iid
+        try:
+            self._hist_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._hist_menu.grab_release()
+
+    def _hist_copy_sha(self) -> None:
+        iid = self._hist_selected_iid
+        if not iid:
+            return
+        vals = self._hist_row_values(iid)
+        sha = str(vals[3]) if len(vals) > 3 else ""
+        if sha:
+            self._copy_to_clipboard(sha)
+            self._toast(f"SHA {sha} скопирован", "info")
+
+    def _hist_open_repo(self) -> None:
+        """Открыть страницу репозитория в браузере (ТЗ п.4)."""
+        url = str(self.cfg.get("repository", "") or "").strip()
+        if not is_repo_url(url):
+            self._toast("Ссылка репозитория не задана", "warn")
+            return
+        # github/gitlab: https://host/owner/repo(.git) → https://host/owner/repo
+        try:
+            import webbrowser
+            parts = url.rstrip("/")
+            if parts.endswith(".git"):
+                parts = parts[:-4]
+            if parts.startswith("git@"):
+                host_path = parts.replace(":", "/", 1)[4:]
+                parts = "https://" + host_path
+            webbrowser.open(parts)
+        except Exception as exc:                             # noqa: BLE001
+            self._toast(f"Не удалось открыть браузер: {exc}", "error")
+
+    def _hist_export(self) -> None:
+        """Экспорт видимых строк вкладки «История» в CSV."""
+        path = filedialog.asksaveasfilename(
+            parent=self.root, title="Экспорт истории в CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")])
+        if not path:
+            return
+        cols = ("time", "type", "branch", "sha", "message")
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(cols)
+                for gid in self.hist_tree.get_children():
+                    for iid in self.hist_tree.get_children(gid):
+                        vals = self._hist_row_values(iid)
+                        if vals:
+                            w.writerow(vals)
+            self.log(f"История экспортирована: {path}")
+            self._toast("История экспортирована в CSV", "success")
+        except OSError as exc:
+            messagebox.showerror(APP_TITLE, f"Не удалось записать CSV: {exc}")
+
+    def _copy_to_clipboard(self, text: str) -> None:
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+        except tk.TclError:
+            pass
 
     # ================================================================== #
     #  Привязка: валидация, протоколы, watcher                             #
@@ -3234,7 +4059,11 @@ class MainWindow:
         return self._w_download
 
     def _validate_field(self, kind) -> bool:
-        """Красная рамка + тултип, если значение некорректно."""
+        """Красная рамка + тултип, если значение некорректно.
+
+        v5 (ТЗ п.3): инлайн-валидация — иконка ✅/❌ рядом с полем; для
+        валидного URL репо дополнительно фоновая проверка `git ls-remote`.
+        """
         value = self._field_value(kind)
         widget = self._field_widget(kind)
         tip = self._tt.get(kind)
@@ -3260,7 +4089,69 @@ class MainWindow:
             pass
         if tip:
             tip.set(reason)
+        # v5: инлайн-иконка статуса поля (✅/❌/⏳)
+        self._set_field_icon(kind, value, reason)
         return not reason
+
+    def _set_field_icon(self, kind: str, value: str, reason: str) -> None:
+        """Иконка-индикатор валидности поля + запуск фоновой проверки URL."""
+        icons = {"folder": getattr(self, "_w_folder_ic", None),
+                 "repo": getattr(self, "_w_repo_ic", None),
+                 "download": getattr(self, "_w_download_ic", None)}
+        lbl = icons.get(kind)
+        if lbl is None:
+            return
+        try:
+            if not value:
+                lbl.configure(text="")
+            elif reason:
+                lbl.configure(text=ICON_FAIL)
+            elif kind == "repo":
+                lbl.configure(text="⏳")
+                self._schedule_remote_check()
+            else:
+                lbl.configure(text=ICON_OK)
+        except tk.TclError:
+            pass
+
+    def _schedule_remote_check(self) -> None:
+        """Фоновый `git ls-remote` по валидному URL (дебаунс 1.2 с)."""
+        sid = getattr(self, "_remote_check_after", None)
+        if sid:
+            try:
+                self.root.after_cancel(sid)
+            except tk.TclError:
+                pass
+        self._remote_check_after = self.root.after(1200, self._run_remote_check)
+
+    def _run_remote_check(self) -> None:
+        self._remote_check_after = None
+        repo = str(self.var_repo.get()).strip()
+        if not is_repo_url(repo) or self.tasks.busy:
+            return
+        timeout_s = min(GitRunner.net_timeout(self.cfg.as_dict()), 30)
+
+        def _check(_cfg: Any, _log: Any) -> str:
+            return self.service.test_remote(repo, timeout_s)
+
+        def _done(result: Any) -> None:
+            try:
+                self._w_repo_ic.configure(text=ICON_OK)
+                self._toast("Репозиторий доступен ✅", "success")
+            except tk.TclError:
+                pass
+
+        def _err(exc: Any) -> None:
+            try:
+                self._w_repo_ic.configure(text=ICON_FAIL)
+                self.log(f"ls-remote: {exc}")
+            except tk.TclError:
+                pass
+
+        try:
+            self._start_bg("remote-check", _check, on_done=_done, on_error=_err)
+        except Exception:                                    # noqa: BLE001
+            pass
 
     # ================================================================== #
     #  Контекстное меню полей                                             #
