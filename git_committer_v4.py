@@ -1,29 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Git Committer v3 — GUI-приложение (Tkinter) для двусторонней синхронизации
-папки и git-репозитория + авто-режимы по таймеру. ООП-рефакторинг по ТЗ:
-модульные функции и «god class» разложены на классы с чёткими зонами
-ответственности, всё остаётся в одном .py.
+Git Committer v4 — GUI-приложение (Tkinter) для двусторонней синхронизации
+папки и git-репозитория + авто-режимы по таймеру. Реализация ТЗ v4:
+безопасность и сохранность данных (Эпик 1), корректность логики (Эпик 2),
+UX (Эпик 3); всё остаётся в одном .py.
 
 Возможности:
   * Большая кнопка «КОММИТ»            — папка → репозиторий (add/commit/push).
   * Кнопка «ВЫГРУЗИТЬ ИЗ РЕПО»         — репозиторий → папка (download).
-  * Поля: Папка, Ссылка репо (кнопка «…» — вставить из буфера), Папка выгрузки.
-  * Выбор ветки из списка (git branch -r), счётчик изменений на кнопке.
+  * Поля: Папка, Ссылка репо (кнопка «…» — вставить из буфера с подтверждением),
+    Папка выгрузки; контекстное меню ПКМ через StringVar.
+  * Выбор ветки из списка (git branch -r), счётчик изменений на кнопке
+    (реальный diff источника с репо, кэш 30 с).
   * Авто-режимы с индивидуальными интервалами, расписанием, watcher'ом, паузой.
-  * Dry-run, автобэкап перед выгрузкой, проверка remote, откат коммита, теги.
-  * Лог в файл с ротацией, звук по окончании, трей, компактный вид.
+  * Настоящий dry-run (диск не трогается, план через ls-remote), preview-план,
+    автобэкап перед выгрузкой с проверкой целостности ZIP, откат коммита, теги.
+  * Защита от инъекций через git-аргументы (валидные URL/ветки, «--», редirects,
+    санитизация токенов в логах), защита от рекурсивной синхронизации,
+    атомарная история операций (ConfigManager + RLock + config.json.bak),
+    зеркальная синхронизация в безопасном режиме (delete_extra по умолчанию
+    выключен, .gitignore не удаляется никогда, deleted_files.log).
+  * Git config user.name/user.email из настроек, auto_pull перед коммитом,
+    диалог разрешения конфликтов merge.
+  * Горячие клавиши: Ctrl+Enter — КОММИТ, Ctrl+D — ВЫГРУЗИТЬ,
+    Ctrl+Shift+D — dry-run, Ctrl+, — конфиг, Ctrl+H — история, F5 — ветки.
+  * История операций в GUI (модалка с колонками, фильтром и экспортом в CSV).
+  * Лог в файл с ротацией, JSON-лог git_committer.jsonl, звук по окончании.
   * Конфиг генерируется сам, пишется атомарно, битый файл бэкапится.
 
 Архитектура (порядок секций файла):
-  imports → константы → errors → models(Config) → services(GitRunner,
-  FileSync, BackupManager, Notifier, RepoService, AutoScheduler, TaskRunner)
-  → ui(PlaceholderEntry, LogPanel, ToolTip, MainWindow) → main().
+  imports → константы → errors → utils(sanitize_url, ConfigManager) →
+  models(Config) → services(GitRunner, FileSync, BackupManager, Notifier,
+  RepoService, AutoScheduler, TaskRunner) → ui(PlaceholderEntry, LogPanel,
+  ToolTip, MainWindow) → main().
 
-Запуск:  python git_committer_v3.py
+Запуск:  python git_committer_v4.py
 Зависимости: стандартная библиотека Python + установленный git.
-Необязательные: pystray + Pillow (трей), watchdog (watcher файлов).
+Необязательные: watchdog (watcher файлов).
 """
 
 # Файл-левел подавления Pylance/Pyright (ТЗ v3.2, п.40): каскад предупреждений
@@ -34,23 +48,28 @@ Git Committer v3 — GUI-приложение (Tkinter) для двусторо�
 #          reportPossiblyUnboundVariable=false, reportMissingImports=false,
 #          reportAttributeAccessIssue=false
 
+import csv
+import fnmatch
 import hashlib
 import json
 import logging
 import os
 import queue
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import zipfile
 from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import tkinter as tk
@@ -76,10 +95,12 @@ except ImportError:
 #  Константы                                                                   #
 # --------------------------------------------------------------------------- #
 
-__version__ = "3.3.0"
+__version__ = "4.0.0"
 APP_TITLE = f"Git Committer v{__version__}"
 CONFIG_NAME = "config.json"
 LOG_NAME = "git_committer.log"
+JSONL_NAME = "git_committer.jsonl"
+DELETED_LOG_NAME = "deleted_files.log"
 HISTORY_LIMIT = 50
 
 GIT_MIN_VERSION = (2, 20)
@@ -93,6 +114,28 @@ GIT_NET_TIMEOUT = 1800
 # Папки/файлы, которые никогда не копируются в репозиторий
 SYNC_IGNORE = {".git", ".venv", "venv", "node_modules", "__pycache__",
                ".idea", ".vscode", ".mypy_cache", ".pytest_cache"}
+
+# Файл, который НИКОГДА не удаляется из worktree при зеркальной чистке
+# (иначе секреты уходят в коммит — ТЗ v4, задача 1.5)
+PROTECT_FROM_DELETE = {".gitignore"}
+
+# Разрешённые схемы URL репозитория (ТЗ v4, задача 1.1)
+ALLOWED_URL_SCHEMES = ("https", "http", "git", "ssh", "file")
+
+# Предупреждение о массовом удалении: больше N файлов — отдельный yes/no
+DELETE_CONFIRM_THRESHOLD = 5
+# Больше N файлов в плане удаления — диалог со списком и прокруткой
+DELETE_LIST_THRESHOLD = 20
+
+# Кэш счётчика изменений, сек (ТЗ v4, задача 2.4)
+CHANGE_COUNT_TTL = 30.0
+
+# Предустановки фильтров синхронизации (ТЗ v4, задача 4.3)
+SYNC_PRESETS = {
+    "Python": "__pycache__,*.pyc,.pytest_cache,.mypy_cache,*.egg-info,.venv",
+    "Node.js": "node_modules,dist,build,.next,coverage,*.log",
+    "C++": "build,Debug,Release,*.o,*.obj,*.exe,.vs",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -122,19 +165,73 @@ def config_path() -> Path:
     return config_dir() / CONFIG_NAME
 
 
+# --------------------------------------------------------------------------- #
+#  Безопасность URL и веток (ТЗ v4, задача 1.1)                                #
+# --------------------------------------------------------------------------- #
+
+_SCP_LIKE_RE = re.compile(r"^[\w.-]+@[\w.-]+:(?!/)[\w./~@+-]+$")
+# Опасные расширения имён репозиториев (git proxy-протоколы): ext::, fd:: …
+_EXT_TRANSPORT_RE = re.compile(r"^[a-zA-Z0-9._-]+::")
+_SENSITIVE_CRED_RE = re.compile(r"(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)(?P<user>[^/:@\s]+)(?::(?P<secret>[^/@\s]*))?@")
+_TOKEN_QUERY_RE = re.compile(
+    r"([?&](?:access_token|id_token|private_token|token|auth|key|password|sig|signature|shared_secret)=)([^&#\s'\"]+)",
+    re.IGNORECASE)
+
+
+def sanitize_url(url: Any) -> str:
+    """Убирает секреты из URL для логов/сообщений об ошибках (ТЗ 1.1).
+
+    * https://user:TOKEN@host/repo → https://user:***@host/repo
+    * ?access_token=abc&x=1       → ?access_token=***&x=1
+    """
+    text = str(url or "")
+    text = _SENSITIVE_CRED_RE.sub(
+        lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
+    text = _TOKEN_QUERY_RE.sub(lambda m: m.group(1) + "***", text)
+    return text
+
+
 def is_repo_url(repo: str) -> bool:
-    """Похожа ли строка на ссылку git-репозитория?"""
-    if not repo:
+    """Строгая проверка ссылки на git-репозиторий (ТЗ v4, задача 1.1).
+
+    Разрешены только схемы https/http/git/ssh/file и scp-формат git@host:path.
+    Запрещены: аргументы опций (первый символ «-»), опасные transport-расширения
+    (ext::sh -c …), управляющие символы и пробелы.
+    """
+    if not repo or not isinstance(repo, str):
         return False
-    lowered = repo.lower()
-    if lowered.startswith(("http://", "https://", "git://", "ssh://",
-                           "git@", "file://")):
-        return True
-    # scp-подобный формат: user@host:path/repo.git (без пробелов)
-    if re.match(r"^[\w.-]+@[\w.-]+:(?!/)[\w./~@-]+$", repo):
-        return True
-    # путь, заканчивающийся на .git — тоже считаем ссылкой на репозиторий
-    if lowered.endswith(".git"):
+    # одна строка, без управляющих символов и пробелов — иначе это не URL
+    if "\n" in repo or "\r" in repo or "\t" in repo or "\0" in repo:
+        return False
+    if repo.startswith("-"):
+        return False                                   # --upload-pack=evil.git
+    if _EXT_TRANSPORT_RE.match(repo):
+        return False                                   # ext::sh -c 'rm -rf ~'
+    candidate = repo.strip()
+    if not candidate or candidate != repo:
+        return False
+    lowered = candidate.lower()
+    for scheme in ALLOWED_URL_SCHEMES:
+        if lowered.startswith(scheme + "://"):
+            try:
+                parts = urlsplit(candidate)
+            except ValueError:
+                return False
+            if parts.scheme.lower() not in ALLOWED_URL_SCHEMES:
+                return False
+            host = (parts.hostname or "").lower() if parts.scheme != "file" else parts.hostname
+            path = parts.path or ""
+            if parts.scheme == "file":
+                return bool(path)                      # file:///path/to/repo(.git)
+            if not host or "." not in host:
+                return False                           # http://evil — нет домена
+            if " " in host or " " in path:
+                return False
+            return True
+    if lowered.startswith("git@") or lowered.startswith("ssh://"):
+        return True if lowered.startswith("ssh://") else bool(_SCP_LIKE_RE.match(candidate))
+    # scp-подобный формат user@host:path (без ведущей «/» в пути)
+    if _SCP_LIKE_RE.match(candidate):
         return True
     return False
 
@@ -148,10 +245,230 @@ def local_clone_dir(repo_url: str) -> Path:
     return config_dir() / f"repo_{name}_{digest}"
 
 
+def _ignore_dirs_factory(patterns: Optional[list[str]] = None):
+    """Фабрика shutil.copytree(ignore): SYNC_IGNORE + egg-info + glob'ы (ТЗ 4.3)."""
+
+    def _ignore(_dir: str, names: list[str]) -> set[str]:
+        ignored = {n for n in names
+                   if n in SYNC_IGNORE or n.endswith(".egg-info")}
+        if patterns:
+            ignored |= {n for n in names if matches_sync_ignore(n, patterns)}
+        return ignored
+
+    return _ignore
+
+
 def _ignore_dirs(_dir: str, names: list[str]) -> set[str]:
     """shutil.copytree(ignore): отсекаем служебные каталоги и *.egg-info."""
-    ignored = {n for n in names if n in SYNC_IGNORE or n.endswith(".egg-info")}
-    return ignored
+    return _ignore_dirs_factory()(_dir, names)
+
+
+def _replace_item(src: Path, dst: Path) -> None:
+    """Безопасно заменяет dst содержимым src (ТЗ v4, задача 1.4).
+
+    Если dst существует (или является симлинком): директория без симлинка —
+    rmtree, иначе unlink. Затем copytree для папок и copy2 для файлов.
+    OSError логируется, но не прерывает синхронизацию остальных файлов.
+    """
+    try:
+        if dst.exists() or dst.is_symlink():
+            if dst.is_dir() and not dst.is_symlink():
+                shutil.rmtree(dst)
+            else:
+                dst.unlink()
+        if src.is_dir():
+            shutil.copytree(src, dst, ignore=_ignore_dirs)
+        else:
+            shutil.copy2(src, dst)
+    except OSError as exc:
+        _log_to_file(f"Не удалось заменить «{dst}» ({exc})", logging.WARNING)
+        raise
+
+
+def validate_branch_name(branch: str, cwd: Any = None) -> str:
+    """Возвращает корректное имя ветки или бросает GitError (ТЗ 1.1).
+
+    Правила: не начинается с «-», без управляющих символов; если доступен
+    git — проверяем через `git check-ref-format --branch`.
+    """
+    name = str(branch or "").strip()
+    if not name:
+        raise GitError("Имя ветки пустое.")
+    if name.startswith("-"):
+        raise GitError(f"Имя ветки не может начинаться с «-»: {name!r}")
+    if any(ch in name for ch in ("\0", "\n", "\r", "~", "^", ":")):
+        raise GitError(f"Некорректное имя ветки: {sanitize_url(name)!r}")
+    if cwd is not None and Path(str(cwd)).exists():
+        try:
+            GitRunner.run(["check-ref-format", "--branch", "--", name], cwd=cwd)
+        except GitError as exc:
+            raise GitError(f"Некорректное имя ветки «{name}»: {exc}") from exc
+    elif not re.match(r"^[\w][\w./@{}+-]*$", name):
+        raise GitError(f"Некорректное имя ветки: {name!r}")
+    return name
+
+
+def ensure_no_option_injection(args: list[str]) -> list[str]:
+    """Гарантирует «--» перед пользовательскими позиционными значениями.
+
+    Используется точечно (clone/fetch/ls-remote); вызывающий код сам ставит
+    «--» там, где git его принимает. Эта функция — страховка для аргументов,
+    начинающихся с дефиса: они отбрасываются с явной ошибкой.
+    """
+    for a in args:
+        s = str(a)
+        if s.startswith("-") and s not in {"-", "--"}:
+            # разрешаем только известные безопасные опции самого приложения
+            if not re.match(r"^--[A-Za-z0-9][A-Za-z0-9_-]*(-[A-Za-z0-9_-]+)*$|^-[A-Za-z]$", s):
+                raise GitError(f"Подозрительный аргумент git запрещён: {sanitize_url(s)!r}")
+    return args
+
+
+def sync_ignore_patterns(cfg: Any) -> list[str]:
+    """Пользовательские glob-паттерны синхронизации из конфига (ТЗ 4.3)."""
+    raw = cfg.get("sync_ignore_patterns", "") if hasattr(cfg, "get") else ""
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = str(raw or "").split(",")
+    return [p.strip() for p in items if str(p).strip()]
+
+
+def matches_sync_ignore(name: str, patterns: list[str]) -> bool:
+    """Имя файла/папки совпадает с любым glob-паттерном?"""
+    return any(fnmatch.fnmatch(name, pat) for pat in patterns)
+
+
+_GITIGNORE_LINE_RE = re.compile(r"\s+#.*$")
+
+
+def load_gitignore_rules(workdir: Path) -> list[str]:
+    """Простейший парсер .gitignore репо: список паттернов (ТЗ 1.5)."""
+    rules: list[str] = []
+    try:
+        text = (Path(workdir) / ".gitignore").read_text(encoding="utf-8",
+                                                        errors="replace")
+    except OSError:
+        return rules
+    for line in text.splitlines():
+        line = _GITIGNORE_LINE_RE.sub("", line)
+        line = line.strip()
+        if not line or line.startswith("!"):
+            continue
+        rules.append(line.lstrip("/"))
+    return rules
+
+
+def is_gitignored(rel_path: str, rules: list[str]) -> bool:
+    """Соответствует ли относительный путь правилам .gitignore."""
+    parts = Path(rel_path).parts
+    for i, part in enumerate(parts):
+        sub = "/".join(parts[i:])
+        name = parts[-1]
+        for rule in rules:
+            r = rule.rstrip("/")
+            if fnmatch.fnmatch(part, r) or fnmatch.fnmatch(sub, r) \
+                    or fnmatch.fnmatch(name, r):
+                return True
+    return False
+
+
+def _log_deleted(paths: list[Any], reason: str) -> None:
+    """Журнал всех удалений в deleted_files.log (ТЗ 1.5)."""
+    try:
+        log_file = config_path().parent / DELETED_LOG_NAME
+        stamp = datetime.now().isoformat(timespec="seconds")
+        with open(log_file, "a", encoding="utf-8") as f:
+            for p in paths:
+                f.write(f"{stamp}\t{reason}\t{p}\n")
+    except OSError:
+        pass
+
+
+def guard_recursive_sync(source: Optional[Path], workdir: Path,
+                         download_folder: Optional[Path]) -> None:
+    """Защита от рекурсивной синхронизации (ТЗ v4, задача 1.3).
+
+    Бросает GitError ДО начала любых операций:
+      * source == workdir;
+      * download_folder внутри workdir и наоборот;
+      * download_folder содержит config_dir (удалит клоны);
+      * системные папки (home, корень диска, USERPROFILE) как цели.
+    """
+    def _res(p: Optional[Path]) -> Optional[Path]:
+        if p is None:
+            return None
+        try:
+            return Path(p).expanduser().resolve()
+        except OSError:
+            return Path(str(p))
+
+    wd = _res(workdir)
+    src = _res(source)
+    dl = _res(download_folder)
+
+    def _inside(a: Optional[Path], b: Optional[Path]) -> bool:
+        return bool(a and b and (a == b or a in b.parents))
+
+    if src is not None and src == wd:
+        raise GitError("Папка-источник совпадает с рабочей копией репозитория — "
+                       "синхронизация в себя запрещена.")
+    if _inside(dl, wd):
+        raise GitError("Папка выгрузки находится внутри рабочей копии репозитория — "
+                       "выберите другую папку (иначе клон будет удалён).")
+    if _inside(wd, dl):
+        raise GitError("Рабочая копия репозитория находится внутри папки выгрузки — "
+                       "синхронизация создала бы бесконечный цикл.")
+    cfg_dir = _res(config_dir())
+    if _inside(cfg_dir, dl):
+        raise GitError("Папка выгрузки содержит директорию конфигурации "
+                       "(config.json и клоны репозиториев) — выбор другой папки "
+                       "обязателен.")
+    if dl is not None:
+        protected = {Path.home().resolve(), Path(dl.anchor or "/")}
+        try:
+            protected.add(Path(os.environ.get("USERPROFILE", "")).resolve())
+        except OSError:
+            pass
+        if dl in protected:
+            raise GitError("Нельзя выгружать в системную папку (домашняя/"
+                           "корень диска) — укажите отдельную подпапку.")
+
+
+# --------------------------------------------------------------------------- #
+#  ConfigManager: единый владелец config.json c RLock (ТЗ v4, задача 1.2)     #
+# --------------------------------------------------------------------------- #
+
+class ConfigManager:
+    """Единая точка доступа к config.json для всех потоков.
+
+    Все операции (load/save/append_history) выполняются под threading.RLock;
+    перед каждой записью — read-modify-write с перечитыванием истории с диска;
+    перед каждой записью создаётся config.json.bak.
+    """
+
+    _lock = threading.RLock()
+
+    @classmethod
+    def append_history(cls, path: Path, entry: dict,
+                       base_data: Optional[dict] = None) -> list:
+        """Атомарно добавляет запись в историю на диске; возвращает историю."""
+        with cls._lock:
+            disk = Config(path)
+            try:
+                disk.load()
+            except Exception as exc:                               # noqa: BLE001
+                print(f"append_history: не удалось прочитать конфиг с диска ({exc}), "
+                      "использую снимок", file=sys.stderr)
+                disk._data = dict(base_data or {})
+            history = disk._data.get("history")
+            if not isinstance(history, list):
+                history = []
+            history.append(entry)
+            del history[:-HISTORY_LIMIT]
+            disk._data["history"] = history
+            disk.save()
+            return history
 
 
 # --------------------------------------------------------------------------- #
@@ -183,9 +500,46 @@ def _setup_file_logging() -> logging.Logger:
     return logger
 
 
+_JSONL_HANDLER_OK: Optional[bool] = None
+
+
+def _jsonl_logger() -> Optional[logging.Logger]:
+    """JSON-лог git_committer.jsonl (ТЗ 5.3): ротация 10 МБ × 5."""
+    global _JSONL_HANDLER_OK
+    if _JSONL_HANDLER_OK is False:
+        return None
+    jlog = logging.getLogger("git_committer.jsonl")
+    if not jlog.handlers:
+        try:
+            h = RotatingFileHandler(
+                str(config_path().parent / JSONL_NAME),
+                maxBytes=10_000_000, backupCount=5, encoding="utf-8")
+            jlog.addHandler(h)
+            jlog.setLevel(logging.INFO)
+            jlog.propagate = False
+            _JSONL_HANDLER_OK = True
+        except OSError:
+            _JSONL_HANDLER_OK = False
+            return None
+    return jlog
+
+
+def log_event(event: str, **data: Any) -> None:
+    """Структурированное событие commit_started/commit_finished/error/sync_files."""
+    jlog = _jsonl_logger()
+    if jlog is None:
+        return
+    record = {"timestamp": datetime.now().isoformat(timespec="milliseconds"),
+              "level": "INFO", "event": event, "data": data}
+    try:
+        jlog.info(json.dumps(record, ensure_ascii=False))
+    except Exception:                                           # noqa: BLE001
+        pass
+
+
 def _log_to_file(msg: str, level: int = logging.INFO) -> None:
-    """Запись сообщения GUI-лога в файл (пишется ВСЕГДА)."""
-    _setup_file_logging().log(level, msg)
+    """Запись сообщения GUI-лога в файл (пишется ВСЕГДА, с санитизацией URL)."""
+    _setup_file_logging().log(level, sanitize_url(msg))
 
 
 # --------------------------------------------------------------------------- #
@@ -195,8 +549,10 @@ def _log_to_file(msg: str, level: int = logging.INFO) -> None:
 class Config:
     """Единственный владелец config.json: загрузка/сохранение/дефолты.
 
-    Атомарная запись (mkstemp + os.replace); битый файл сохраняется как
-    config.broken.json и пересоздаётся. Наружу — только get/set/update/as_dict.
+    Атомарная запись (mkstemp + os.replace) под глобальным RLock
+    ConfigManager; перед каждой записью — перечитывание истории с диска
+    (read-modify-write) и бэкап config.json.bak. Битый файл сохраняется как
+    config.broken.json и пересоздаётся. Наружу — get/set/update/as_dict.
     """
 
     def __init__(self, path: Path) -> None:
@@ -214,7 +570,9 @@ class Config:
             "author_name": "Git Committer",              # локальный автор коммита
             "author_email": "committer@local",
             "push": False,                               # пушить после ручного КОММИТА
-            "delete_extra": True,      # удалять в репо файлы, отсутствующие в источнике
+            # ТЗ v4 1.5: зеркальная чистка ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА — файлы
+            # коллег из репо не удаляются, пока пользователь не включит явно.
+            "delete_extra": False,
             "history": [],                               # последние удачные операции
             # ---- авто-режимы и выгрузка ---------------------------------
             "auto_commit": False,                        # авто-коммит по таймеру
@@ -234,16 +592,25 @@ class Config:
             "backup_keep_last": 10,                      # хранить последних N бэкапов
             "confirm_delete_extras": True,               # спрашивать перед удалением лишнего
             "sound_on_finish": False,                    # звук по окончании задачи
-            "tray_on_close": False,                      # сворачивать в трей при закрытии
-            "compact_view": False,                       # мини-режим интерфейса
             "watch_source": False,                       # авто-коммит по изменению файлов
             "auto_push": False,                          # push после АВТО-коммита
+            # ---- v4 (ТЗ Git Committer v4) --------------------------------
+            "version": 4,                                # схема конфига v4
+            "respect_gitignore": True,       # не копировать в репо файлы из .gitignore
+            "auto_pull_before_commit": True, # git pull --ff-only перед коммитом (ТЗ 4.1)
+            "accurate_count": False,         # точный (медленный) подсчёт изменений (ТЗ 2.4)
+            "sync_ignore_patterns": "",      # glob-паттерны через запятую (ТЗ 4.3)
+            "skip_confirm_targets": [],      # папки выгрузки с «не показывать снова» (ТЗ 2.5)
         }
 
     # ------------------------------------------------------------------ #
 
     def load(self) -> None:
-        """Читает конфиг; если файла нет — создаёт его автоматически."""
+        """Читает конфиг; если файла нет — создаёт его автоматически.
+
+        Миграция (ТЗ «Риски»): отсутствующие ключи добиваются дефолтами,
+        поэтому старые конфиги v2/v3 читаются без правок кода.
+        """
         path = self._path
         if not path.exists():
             self._data = self.defaults()
@@ -279,34 +646,67 @@ class Config:
         days = [d for d in sched.get("days", []) if isinstance(d, int) and 1 <= d <= 7]
         sched["days"] = sorted(set(days))
         data["auto_schedule"] = sched
+        if not isinstance(data.get("skip_confirm_targets"), list):
+            data["skip_confirm_targets"] = []
         self._data = data
 
     def save(self) -> None:
-        """Атомарная запись: mkstemp + os.replace; tmp/fd чистятся при ошибке."""
-        path = self._path
-        data = dict(self._data)
-        data["last_version"] = __version__
-        tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
-        fd_owned = False
-        try:
-            f = os.fdopen(tmp_fd, "w", encoding="utf-8")
-            fd_owned = True
-            with f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_name, path)
-        except Exception:                                   # noqa: BLE001
-            # Если os.fdopen бросил исключение — fd всё ещё наш, закрываем сами.
-            if not fd_owned:
+        """Атомарная запись под RLock + config.json.bak + read-modify-write.
+
+        Перед записью перечитываем историю с диска (рабочий поток мог добавить
+        записи, пока GUI держал снимок), затем mkstemp + os.replace.
+        tmp/fd чистятся при ошибке.
+        """
+        with ConfigManager._lock:
+            path = self._path
+            # read-modify-write: история с диска важнее снимка
+            if path.exists():
                 try:
-                    os.close(tmp_fd)
-                except OSError:
+                    with open(path, "r", encoding="utf-8") as f:
+                        disk_data = json.load(f)
+                    if isinstance(disk_data, dict):
+                        disk_hist = disk_data.get("history")
+                        if isinstance(disk_hist, list) and len(disk_hist) > len(
+                                self._data.get("history") or []):
+                            merged = list(disk_hist)
+                            own = {json.dumps(e, sort_keys=True)
+                                  for e in self._data.get("history") or []}
+                            for entry in self._data.get("history") or []:
+                                if json.dumps(entry, sort_keys=True) not in own:
+                                    merged.append(entry)
+                            del merged[:-HISTORY_LIMIT]
+                            self._data["history"] = merged
+                except (OSError, ValueError):
                     pass
+            data = dict(self._data)
+            data["last_version"] = __version__
+            # бэкап config.json перед каждой записью (ТЗ 1.2)
             try:
-                if os.path.exists(tmp_name):
-                    os.remove(tmp_name)
+                if path.exists():
+                    shutil.copy2(path, path.parent / (path.name + ".bak"))
             except OSError:
                 pass
-            raise
+            tmp_fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+            fd_owned = False
+            try:
+                f = os.fdopen(tmp_fd, "w", encoding="utf-8")
+                fd_owned = True
+                with f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_name, path)
+            except Exception:                                   # noqa: BLE001
+                # Если os.fdopen бросил исключение — fd всё ещё наш, закрываем сами.
+                if not fd_owned:
+                    try:
+                        os.close(tmp_fd)
+                    except OSError:
+                        pass
+                try:
+                    if os.path.exists(tmp_name):
+                        os.remove(tmp_name)
+                except OSError:
+                    pass
+                raise
 
     def reload(self) -> None:
         """Перечитать диск (ручные правки config.json подхватываются на лету)."""
@@ -332,31 +732,13 @@ class Config:
     def append_history(self, entry: dict) -> None:
         """Добавляет запись в историю (максимум HISTORY_LIMIT).
 
-        Пишется напрямую в config.json read-modify-write: рабочий конфиг может
-        быть снапшотом, сделанным до других изменений GUI, — прямая запись их
-        не затрёт.
-
-        ВНИМАНИЕ: если у этого экземпляра Config есть несохранённые правки
-        (set/update без save()), они НЕ попадают на диск этим методом и могут
-        быть потеряны при следующем load(). Вызывающий код обязан сохранять
-        конфиг сам (MainWindow делает это через _collect_cfg + save перед
-        долгоживущими операциями).
+        Единый путь — ConfigManager под RLock: перечитывание истории с диска
+        (read-modify-write), сохранение через бэкап config.json.bak. Рабочие
+        потоки вызывают этот метод только через очередь TaskRunner в главном
+        потоке (ТЗ v4, задача 1.2).
         """
-        disk = Config(self._path)
-        try:
-            disk.load()
-        except Exception as exc:                               # noqa: BLE001
-            # Не глушим молча: fallback на снимок, но предупреждаем в stderr.
-            print(f"append_history: не удалось прочитать конфиг с диска ({exc}), "
-                  "использую снимок", file=sys.stderr)
-            disk._data = dict(self._data)
-        history = disk._data.get("history")
-        if not isinstance(history, list):
-            history = []
-        history.append(entry)
-        del history[:-HISTORY_LIMIT]
-        disk._data["history"] = history
-        disk.save()
+        history = ConfigManager.append_history(self._path, entry,
+                                               base_data=self._data)
         self._data["history"] = history          # держим снимок в курсе
 
     # ---- обратная совместимость с тестами v1/v2 ----------------------- #
@@ -394,7 +776,8 @@ class GitRunner:
     """Единственная точка выхода в subprocess для git.
 
     env GIT_TERMINAL_PROMPT=0 / GIT_EDITOR=true / GCM_INTERACTIVE=never,
-    таймауты, парсинг ошибок → GitError.
+    `-c`-опции против опасных репозиториев (ТЗ 1.1), таймауты, парсинг
+    ошибок → GitError с санитизацией URL.
     """
 
     @staticmethod
@@ -406,9 +789,16 @@ class GitRunner:
         env["GIT_TERMINAL_PROMPT"] = "0"
         env["GIT_EDITOR"] = "true"
         env["GCM_INTERACTIVE"] = "never"        # Git Credential Manager
+        # Защита от инъекций через конфиги вредоносного репозитория (ТЗ 1.1):
+        # отключаем опасные protocol/extensions и автовызов hook'ов.
+        hardening = ["-c", "protocol.ext.allow=never",
+                     "-c", "core.fsmonitor=false",
+                     "-c", "hooks.allownonascii=true"]
+        cmd = ["git", *hardening, *args]
+        label_args = " ".join(sanitize_url(a) for a in args)
         try:
             proc = subprocess.run(              # noqa: S603, PLW1510
-                ["git", *args],
+                cmd,
                 cwd=str(cwd) if cwd else None,
                 capture_output=True,
                 text=True,
@@ -422,10 +812,10 @@ class GitRunner:
             raise GitError("Команда «git» не найдена в системе. Установите git.")
         except subprocess.TimeoutExpired:
             label = f"{timeout} с" if timeout else "неограниченно долго"
-            raise GitError(f"Команда «git {' '.join(args)}» не завершилась за {label}.")
+            raise GitError(f"Команда «git {label_args}» не завершилась за {label}.")
         if proc.returncode != 0:
-            raise GitError((proc.stderr or proc.stdout or "")
-                           .strip() or f"git {' '.join(args)} завершился с ошибкой")
+            detail = sanitize_url((proc.stderr or proc.stdout or "").strip())
+            raise GitError(detail or f"git {label_args} завершился с ошибкой")
         return (proc.stdout or "").strip()
 
     @staticmethod
@@ -500,107 +890,186 @@ _default_git_runner = GitRunner()
 # --------------------------------------------------------------------------- #
 
 class FileSync:
-    """Копирование source ↔ workdir. Ничего не знает про git — только файлы."""
+    """Копирование source ↔ workdir. Ничего не знает про git — только файлы.
+
+    Все замены элементов выполняются через _replace_item (ТЗ 1.4): корректно
+    переживает смену типа «файл ↔ папка» и не роняет синхронизацию из-за
+    ошибки на одном объекте. Пользовательские glob-паттерны (sync_ignore_
+    patterns, ТЗ 4.3) применяются к верхнеуровевым именам; respect_gitignore
+    (ТЗ 1.5) фильтрует файлы по .gitignore репозитория.
+    """
 
     @staticmethod
-    def into_repo(source: Path, workdir: Path, delete_extra: bool = True) -> int:
+    def _copy_tree(src_dir: Path, dst_dir: Path, ignore_patterns: list[str],
+                   gitignore_rules: Optional[list[str]] = None,
+                   base: Optional[Path] = None) -> int:
+        """Рекурсивно копирует дерево src_dir в dst_dir с фильтрами.
+
+        Возвращает число скопированных объектов; OSError на отдельном файле
+        логируется и не прерывает обход (ТЗ 1.4).
+        """
+        copied = 0
+        base = base if base is not None else src_dir
+        try:
+            entries = sorted(src_dir.iterdir())
+        except OSError as exc:
+            _log_to_file(f"Не удалось прочитать «{src_dir}» ({exc})",
+                         logging.WARNING)
+            return 0
+        for item in entries:
+            if item.name in SYNC_IGNORE or item.name.endswith(".egg-info"):
+                continue
+            if matches_sync_ignore(item.name, ignore_patterns):
+                continue
+            rel = str(item.relative_to(base))
+            if gitignore_rules and item.is_file() \
+                    and is_gitignored(rel, gitignore_rules):
+                continue
+            dest = dst_dir / item.name
+            try:
+                if item.is_dir():
+                    dst_dir.mkdir(parents=True, exist_ok=True)
+                    copied += FileSync._copy_tree(item, dest, ignore_patterns,
+                                                  gitignore_rules, base)
+                else:
+                    _replace_item(item, dest)
+                    copied += 1
+            except OSError:
+                continue                       # один файл — не повод всё ронять
+        return copied
+
+    @staticmethod
+    def into_repo(source: Path, workdir: Path, delete_extra: bool = False,
+                  cfg: Any = None) -> int:
         """
         Копирует содержимое папки-источника в рабочую копию репозитория.
-          * пропускает служебные папки (SYNC_IGNORE);
+          * пропускает служебные папки (SYNC_IGNORE) и пользовательские
+            glob-паттерны sync_ignore_patterns (ТЗ 4.3);
+          * respect_gitignore — файлы из .gitignore репо не копируются (ТЗ 1.5);
           * при delete_extra удаляет в рабочей копии файлы/папки, которых нет
-            в источнике (кроме .git), чтобы дерево точно отражало источник.
+            в источнике (кроме .git и защищённого .gitignore!), чтобы дерево
+            точно отражало источник; удаления пишутся в deleted_files.log.
         Возвращает число синхронизированных верхнеуровневых объектов.
         """
         source, workdir = Path(source), Path(workdir)
+        patterns = sync_ignore_patterns(cfg) if cfg is not None else []
+        gi_rules = load_gitignore_rules(workdir) if (
+            cfg is not None and cfg.get("respect_gitignore", True)) else None
         count = 0
         source_names = set()
         for item in sorted(source.iterdir()):
-            if item.name in SYNC_IGNORE:
+            if item.name in SYNC_IGNORE or item.name.endswith(".egg-info"):
+                continue
+            if matches_sync_ignore(item.name, patterns):
+                continue
+            if gi_rules and item.is_file() \
+                    and is_gitignored(item.name, gi_rules):
                 continue
             source_names.add(item.name)
             dest = workdir / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest, ignore=_ignore_dirs)
-            else:
-                shutil.copy2(item, dest)
-            count += 1
+            try:
+                if item.is_dir():
+                    # содержимое папки сливаем поверх существующей (инкрементально)
+                    dest.mkdir(parents=True, exist_ok=True)
+                    FileSync._copy_tree(item, dest, patterns, gi_rules)
+                else:
+                    _replace_item(item, dest)
+                count += 1
+            except OSError:
+                continue
 
         if delete_extra:
-            for old in sorted(workdir.iterdir()):
-                if old.name in SYNC_IGNORE or old.name in source_names:
-                    continue
-                if old.is_dir():
-                    shutil.rmtree(old)
-                else:
-                    old.unlink()
-
+            doomed = [old for old in sorted(workdir.iterdir())
+                      if old.name not in SYNC_IGNORE
+                      and old.name not in source_names
+                      and old.name not in PROTECT_FROM_DELETE]
+            for old in doomed:
+                try:
+                    if old.is_dir() and not old.is_symlink():
+                        shutil.rmtree(old)
+                    else:
+                        old.unlink()
+                    _log_deleted([old], "into_repo delete_extra")
+                except OSError as exc:
+                    _log_to_file(f"Не удалось удалить «{old}» ({exc})",
+                                 logging.WARNING)
         return count
 
     @staticmethod
     def from_repo(workdir: Path, target: Path,
-                  confirm: Optional[Callable[[Path], bool]] = None) -> tuple:
+                  confirm: Optional[Callable[[Path], bool]] = None,
+                  delete_extra: bool = False, cfg: Any = None) -> tuple:
         """Выгрузка содержимого рабочей копии (без .git) поверх целевой папки.
 
+        delete_extra=False (дефолт ТЗ 1.5) — лишние файлы цели НЕ удаляются.
         confirm(target)->bool решает судьбу «лишних» файлов (тех, которых нет
-        в репо); confirm=None — удалять безусловно. Служебные объекты
-        (SYNC_IGNORE: .git целевой папки и т.п.) не удаляем никогда.
-        Возвращает (число скопированных объектов, список удалённых путей).
+        в репо); confirm=None при включённом delete_extra — удалять безусловно.
+        Служебные объекты (SYNC_IGNORE) и .gitignore не удаляем никогда.
+        Возвращает (число скопированных объектов, список удалённых путей,
+        флаг отмены, число лишних объектов).
         """
         workdir, target = Path(workdir), Path(target)
         repo_names = {item.name for item in workdir.iterdir()
                       if item.name not in SYNC_IGNORE}
         extras = [p for p in sorted(target.iterdir())
-                  if p.name not in repo_names and p.name not in SYNC_IGNORE] \
+                  if p.name not in repo_names and p.name not in SYNC_IGNORE
+                  and p.name not in PROTECT_FROM_DELETE] \
             if target.is_dir() else []
-        do_clean = bool(extras)
+        do_clean = bool(extras) and bool(delete_extra)
         cancelled = False
-        if extras and confirm is not None:
+        if extras and delete_extra and confirm is not None:
             do_clean = bool(confirm(target))
             cancelled = not do_clean
 
         target.mkdir(parents=True, exist_ok=True)
 
+        patterns = sync_ignore_patterns(cfg) if cfg is not None else []
         copied = 0
         for item in sorted(workdir.iterdir()):
             if item.name in SYNC_IGNORE:
                 continue
+            if matches_sync_ignore(item.name, patterns):
+                continue
             dest = target / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest, ignore=_ignore_dirs)
-            else:
-                shutil.copy2(item, dest)
-            copied += 1
+            try:
+                _replace_item(item, dest)
+                copied += 1
+            except OSError:
+                continue
 
         removed = []
         if extras and do_clean:
             for old_item in extras:
-                if old_item.is_dir() and not old_item.is_symlink():
-                    shutil.rmtree(old_item)
-                else:
-                    old_item.unlink()
-                removed.append(old_item)
+                try:
+                    if old_item.is_dir() and not old_item.is_symlink():
+                        shutil.rmtree(old_item)
+                    else:
+                        old_item.unlink()
+                    removed.append(old_item)
+                except OSError as exc:
+                    _log_to_file(f"Не удалось удалить «{old_item}» ({exc})",
+                                 logging.WARNING)
+            _log_deleted(removed, "from_repo delete_extra")
         return copied, removed, cancelled, len(extras)
 
     @staticmethod
-    def copy_repo_items(workdir: Path, target: Path) -> int:
+    def copy_repo_items(workdir: Path, target: Path, cfg: Any = None) -> int:
         """Только копирование (без чистки лишнего) — используется в download."""
         workdir, target = Path(workdir), Path(target)
+        target.mkdir(parents=True, exist_ok=True)
+        patterns = sync_ignore_patterns(cfg) if cfg is not None else []
         copied = 0
         for item in sorted(workdir.iterdir()):
             if item.name in SYNC_IGNORE:
                 continue
+            if matches_sync_ignore(item.name, patterns):
+                continue
             dest = target / item.name
-            if item.is_dir():
-                if dest.exists():
-                    shutil.rmtree(dest)
-                shutil.copytree(item, dest, ignore=_ignore_dirs)
-            else:
-                shutil.copy2(item, dest)
-            copied += 1
+            try:
+                _replace_item(item, dest)
+                copied += 1
+            except OSError:
+                continue
         return copied
 
     @staticmethod
@@ -641,9 +1110,11 @@ class BackupManager:
 
     def backup(self, folder: Path,
                log: Optional[Callable[[str], None]] = None) -> Path:
-        """ZIP-бэкап содержимого папки в ./backups/<имя>_<YYYYMMDD_HHMMSS>.zip.
+        """ZIP-бэкап содержимого папки + проверка целостности (ТЗ v4, задача 2.7).
 
         Служебные папки (SYNC_IGNORE, включая .git) в архив не кладём.
+        После записи: zf.testzip() и сверка числа файлов с count_files —
+        неполный бэкап прерывается GitError (выгрузка не начнётся).
         """
         folder = Path(folder)
         keep = self._keep_count()
@@ -652,6 +1123,7 @@ class BackupManager:
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_name = re.sub(r"[^\w.-]", "_", folder.name) or "target"
         zip_path = bdir / f"{safe_name}_{stamp}.zip"
+        expected = FileSync.count_files(folder)
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for root_dir, dirs, files in os.walk(folder):
                 dirs[:] = [d for d in dirs if d not in SYNC_IGNORE]
@@ -663,11 +1135,31 @@ class BackupManager:
                         continue
                     try:
                         zf.write(full, arcname=str(rel))
-                    except OSError:
-                        pass                                   # пропущен/нет прав
+                    except OSError as exc:
+                        # молча пропустить нельзя — бэкап станет неполным
+                        raise GitError(
+                            f"Бэкап прерван: нет доступа к «{full}» ({exc})") from exc
+            bad = zf.testzip()
+        integrity = "OK" if bad is None else f"ПОВРЕЖДЁН: {bad}"
+        actual = 0
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                actual = len(zf.namelist())
+        except OSError as exc:
+            raise GitError(f"Бэкап не читается: {exc}") from exc
+        if bad is not None:
+            raise GitError(f"Бэкап повреждён (testzip: {bad}) — выгрузка отменена.")
+        if actual != expected:
+            raise GitError(
+                f"Бэкап неполный: в ZIP {actual} файл(ов), в папке {expected} — "
+                "выгрузка отменена.")
         self.rotate(prefix=safe_name, keep=keep)
+        size = zip_path.stat().st_size if zip_path.exists() else 0
         if log:
-            log(f"Бэкап целевой папки: {zip_path.name}")
+            log(f"Бэкап целевой папки: {zip_path.name} — файлов {actual}/{expected}, "
+                f"размер {size // 1024 + 1} КБ, целостность {integrity}")
+        _log_to_file(f"BACKUP {folder} -> {zip_path.name}: files={actual}/"
+                     f"{expected} size={size} integrity={integrity}")
         return zip_path
 
     def rotate(self, prefix: str = "*", keep: int = 10) -> None:
@@ -1501,10 +1993,8 @@ class MainWindow:
         self._last_watch_event = 0.0             # дебаунс watcher'а
         self._watch_stop = None                  # Event остановки observer'а
         self._watch_thread = None
-        self._tray_icon = None
         self._force_quit = False
         self._tt = {}                            # тултипы полей
-        self._layout_spec = {}                   # спецификации раскладки (compact)
 
         if self.cfg.get("auto_commit"):
             self.scheduler.toggle("commit", True)
@@ -1536,15 +2026,13 @@ class MainWindow:
         main_frame.pack(fill="both", expand=True)
 
         def _g(widget, **kw):
-            """grid с сохранением спецификации (для compact-режима)."""
+            """grid с возвратом виджета."""
             widget.grid(**kw)
-            self._layout_spec[widget] = ("grid", kw)
             return widget
 
         def _p(widget, **kw):
-            """pack с сохранением спецификации (для compact-режима)."""
+            """pack с возвратом виджета."""
             widget.pack(**kw)
-            self._layout_spec[widget] = ("pack", kw)
             return widget
 
         # --- верхняя строка: пути + кнопки "…" ----------------------------- #
@@ -1773,16 +2261,13 @@ class MainWindow:
             ("backup_before_download", "Бэкап целевой папки"),
             ("confirm_delete_extras", "Спрашивать перед удалением лишних"),
             ("sound_on_finish", "Звук после задачи"),
-            ("tray_on_close", "В трей при закрытии"),
-            ("compact_view", "Компактный вид"),
         ]
         self.var_checks = {}
         for i, (key, label) in enumerate(grid_checks):
             var_cb = tk.BooleanVar(value=bool(cfg.get(key)))
             self.var_checks[key] = var_cb
-            extra = {"command": lambda: self._apply_compact()} \
-                if key == "compact_view" else {"command": self._on_settings_change}
-            ttk.Checkbutton(self._w_checks, text=label, variable=var_cb, **extra)\
+            ttk.Checkbutton(self._w_checks, text=label, variable=var_cb,
+                            command=self._on_settings_change)\
                 .grid(row=i // 2, column=i % 2, sticky="w", padx=6, pady=2)
 
         # --- нижняя строка: статус + маленькая кнопка "..." (открыть конфиг) #
@@ -1810,13 +2295,12 @@ class MainWindow:
                 w.bind(seq, self._show_entry_menu)
 
     # ================================================================== #
-    #  Привязка: валидация, трей, протоколы, watcher                       #
+    #  Привязка: валидация, протоколы, watcher                             #
     # ================================================================== #
 
     def _wire(self):
         self._setup_validation()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close_window)
-        self._apply_compact()
         if self.var_watch.get():
             self._start_watcher()
 
@@ -2036,42 +2520,6 @@ class MainWindow:
         if tip:
             tip.set(reason)
         return not reason
-
-    # ================================================================== #
-    #  Компактный вид                                                     #
-    # ================================================================== #
-
-    def _apply_compact(self) -> None:
-        """Мини-режим: скрывает «Папку выгрузки», «Сообщение», «Ветку», лог.
-
-        Остаются: Папка, Репо, КОММИТ, ВЫГРУЗИТЬ, авто-блок.
-        Спецификации раскладки сохранены в self._layout_spec — при возврате
-        к обычному виду виджеты восстанавливаются на свои места.
-        """
-        compact = bool(self.var_checks["compact_view"].get())
-        hidden_attrs = ("_w_download_label", "_w_download", "_w_download_btn",
-                        "_w_message_label", "_w_message",
-                        "_w_branch_label", "_w_branch_row",
-                        "_w_log")
-        for attr in hidden_attrs:
-            w = getattr(self, attr, None)
-            if w is None:
-                continue
-            spec = self._layout_spec.get(w)
-            manager = str(w.winfo_manager())
-            if compact:
-                if manager:                      # виджет сейчас отображён
-                    w.grid_forget() if manager == "grid" else w.pack_forget()
-            elif not manager and spec:           # был скрыт — вернуть
-                kind, kw = spec
-                if kind == "grid":
-                    w.grid(**kw)
-                else:
-                    w.pack(**kw)
-        try:
-            self._collect_cfg()
-        except Exception:                                        # noqa: BLE001
-            pass
 
     # ================================================================== #
     #  Контекстное меню полей                                             #
@@ -2804,71 +3252,14 @@ class MainWindow:
                 break  # один запуск за тик; второй авто — следующим тиком/по плану
 
     # ================================================================== #
-    #  Закрытие окна / трей                                               #
+    #  Закрытие окна                                                      #
     # ================================================================== #
 
     def _on_close_window(self) -> None:
-        if self.var_checks["tray_on_close"].get():
-            if self._ensure_tray():
-                self.root.withdraw()
-                self.log("Приложение свёрнуто в трей (клик по иконке — развернуть).")
-                return
         self._quit_app()
-
-    def _ensure_tray(self) -> bool:
-        """Ленивый запуск pystray; False, если библиотека недоступна."""
-        if self._tray_icon is not None:
-            return True
-        try:
-            import pystray
-            from PIL import Image, ImageDraw
-        except ImportError:
-            messagebox.showinfo(
-                APP_TITLE,
-                "Для работы в трее нужны библиотеки pystray и Pillow:\n\n"
-                "    pip install pystray Pillow\n\n"
-                "Приложение будет закрыто обычным способом.")
-            self.var_checks["tray_on_close"].set(False)
-            return False
-        try:
-            img = Image.new("RGB", (64, 64), "#1f8b4c")
-            d = ImageDraw.Draw(img)
-            d.rectangle((14, 14, 50, 50), outline="white", width=6)
-            icon = pystray.Icon("git_committer", img, APP_TITLE,
-                                menu=pystray.Menu(
-                                    pystray.MenuItem("Показать окно",
-                                                     self._tray_show, default=True),
-                                    pystray.MenuItem("Выход",
-                                                     self._tray_quit)))
-            threading.Thread(target=icon.run, daemon=True).start()
-            self._tray_icon = icon
-            return True
-        except Exception as exc:                             # noqa: BLE001
-            self.log(f"Не удалось запустить трей: {exc}")
-            return False
-
-    def _tray_show(self, icon: Any = None, _item: Any = None) -> None:
-        def _do():
-            self.root.deiconify()
-            self.root.lift()
-            if icon is not None:
-                try:
-                    icon.stop()
-                except Exception:                            # noqa: BLE001
-                    pass
-                self._tray_icon = None
-        self.root.after(0, _do)
-
-    def _tray_quit(self, icon: Any = None, _item: Any = None) -> None:
-        self.root.after(0, self._quit_app)
 
     def _quit_app(self) -> None:
         self._force_quit = True
-        if self._tray_icon is not None:
-            try:
-                self._tray_icon.stop()
-            except Exception:                                # noqa: BLE001
-                pass
         self._stop_watcher()
         try:
             self._collect_cfg()
