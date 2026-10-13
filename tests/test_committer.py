@@ -9,7 +9,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-SCRIPT = "/workspace/git_committer.py"
+SCRIPT = "/workspace/git_committer_v4.py"
 PASS, FAIL = 0, []
 
 def check(name, cond, detail=""):
