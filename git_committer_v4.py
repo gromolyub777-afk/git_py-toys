@@ -129,6 +129,7 @@ DELETE_LIST_THRESHOLD = 20
 
 # Кэш счётчика изменений, сек (ТЗ v4, задача 2.4)
 CHANGE_COUNT_TTL = 30.0
+CHANGE_COUNT_CACHE_TTL = CHANGE_COUNT_TTL
 
 # Предустановки фильтров синхронизации (ТЗ v4, задача 4.3)
 SYNC_PRESETS = {
@@ -193,8 +194,15 @@ def sanitize_url(url: Any) -> str:
     * ?access_token=abc&x=1       → ?access_token=***&x=1
     """
     text = str(url or "")
-    text = _SENSITIVE_CRED_RE.sub(
-        lambda m: f"{m.group('scheme')}{m.group('user')}:***@", text)
+
+    def _mask_userinfo(m):
+        scheme = m.group("scheme")
+        user = m.group("user")
+        if m.group("secret") is not None:
+            return f"{scheme}{user}:***@"
+        return f"{scheme}***@"
+
+    text = _SENSITIVE_CRED_RE.sub(_mask_userinfo, text)
     text = _TOKEN_QUERY_RE.sub(lambda m: m.group(1) + "***", text)
     return text
 
@@ -258,21 +266,14 @@ def local_clone_dir(repo_url: str) -> Path:
     return config_dir() / f"repo_{name}_{digest}"
 
 
-def confirm_delete_allowed(do_clean: bool, extras_count: int,
-                           threshold: int = DELETE_CONFIRM_THRESHOLD) -> bool:
-    """Финальный предохранитель массового удаления (ТЗ v4, задача 1.5).
+def needs_extra_confirmation(extras_count: int,
+                             threshold: int = DELETE_CONFIRM_THRESHOLD) -> bool:
+    """True — требуется отдельный диалог при массовом удалении (ТЗ 1.5)."""
+    return extras_count > threshold
 
-    Смысл: чистка «лишних» файлов допустима, только если решение о чистке
-    уже принято (do_clean=True — пользователь подтвердил в GUI или операция
-    явно разрешена конфигом) И объём удаления не превышает порог threshold.
-    При do_clean=False удалять ничего не планируется — проверка не нужна,
-    возвращаем True. Если подтверждение получено, но удалению подлежит
-    больше threshold объектов без отдельного подтверждения пользователя,
-    вызывающий код обязан отменить чистку (вернём False).
-    """
-    if not do_clean:
-        return True
-    return extras_count <= threshold
+
+# Прежнее имя сохранено как алиас для обратной совместимости.
+confirm_delete_allowed = needs_extra_confirmation
 
 
 def _ignore_dirs_factory(patterns: Optional[list[str]] = None):
@@ -446,20 +447,25 @@ def guard_recursive_sync(source: Optional[Path], workdir: Path,
     src = _res(source)
     dl = _res(download_folder)
 
-    def _inside(a: Optional[Path], b: Optional[Path]) -> bool:
+    def _is_ancestor(a: Optional[Path], b: Optional[Path]) -> bool:
+        """True, если a — предок b (или совпадает), т.е. b лежит внутри a."""
         return bool(a and b and (a == b or a in b.parents))
 
     if src is not None and src == wd:
         raise GitError("Папка-источник совпадает с рабочей копией репозитория — "
                        "синхронизация в себя запрещена.")
-    if _inside(dl, wd):
-        raise GitError("Папка выгрузки находится внутри рабочей копии репозитория — "
-                       "выберите другую папку (иначе клон будет удалён).")
-    if _inside(wd, dl):
-        raise GitError("Рабочая копия репозитория находится внутри папки выгрузки — "
-                       "синхронизация создала бы бесконечный цикл.")
+    # FIX-1.1: _is_ancestor(dl, wd) истинно, когда wd лежит ВНУТРИ dl.
+    if _is_ancestor(dl, wd):
+        raise GitError("Рабочая копия репозитория находится внутри папки "
+                       "выгрузки — синхронизация создала бы бесконечный цикл.")
+    # FIX-1.1: _is_ancestor(wd, dl) истинно, когда dl лежит ВНУТРИ wd.
+    if _is_ancestor(wd, dl):
+        raise GitError("Папка выгрузки находится внутри рабочей копии "
+                       "репозитория — выберите другую папку (иначе клон будет "
+                       "удалён).")
     cfg_dir = _res(config_dir())
-    if _inside(cfg_dir, dl):
+    # FIX-1.1: dl содержит cfg_dir → cfg_dir лежит внутри dl.
+    if _is_ancestor(dl, cfg_dir):
         raise GitError("Папка выгрузки содержит директорию конфигурации "
                        "(config.json и клоны репозиториев) — выбор другой папки "
                        "обязателен.")
@@ -708,10 +714,12 @@ class Config:
                         if isinstance(disk_hist, list) and len(disk_hist) > len(
                                 self._data.get("history") or []):
                             merged = list(disk_hist)
-                            own = {json.dumps(e, sort_keys=True)
-                                  for e in self._data.get("history") or []}
+                            # FIX-1.2: сравниваем с ключами ДИСКА, а не со
+                            # снимком памяти — иначе новые записи не долетают.
+                            disk_keys = {json.dumps(e, sort_keys=True)
+                                         for e in disk_hist}
                             for entry in self._data.get("history") or []:
-                                if json.dumps(entry, sort_keys=True) not in own:
+                                if json.dumps(entry, sort_keys=True) not in disk_keys:
                                     merged.append(entry)
                             del merged[:-HISTORY_LIMIT]
                             self._data["history"] = merged
@@ -868,7 +876,9 @@ class GitRunner:
             return False, ()
         m = re.search(r"(\d+)\.(\d+)", out)
         if not m:
-            return True, (out.strip() or "неизвестно",)
+            # FIX-1.3: возвращаем строку, а не 1-кортеж — иначе main()
+            # печатал первый символ вместо всего текста.
+            return True, (out.strip() or "неизвестно")
         return True, (int(m.group(1)), int(m.group(2)))
 
     @staticmethod
@@ -1285,6 +1295,9 @@ class RepoService:
     Не знает про Tk: диалоги — через переданный callable `confirm`,
     вывод — через callable `log`.
     """
+
+    # Кэш счётчика изменений: f"{repo}|{source}" -> (monotonic_ts, int)
+    _count_cache: dict = {}
 
     def __init__(self,
                  git: Optional[GitRunner] = None,
@@ -1740,6 +1753,12 @@ class RepoService:
 
         message = self.make_commit_message(cfg)
 
+        # FIX-3.1: событие пишем ДО git commit — иначе JSON-лог показывает
+        # «started» после фактического завершения и timeline врёт.
+        log_event("commit_started", branch=branch, message=message, auto=auto)
+        log_event("sync_files", copied=n,
+                  deleted_extra=bool(cfg.get("delete_extra", False)))
+
         author = str(cfg.get("author_name", "")).strip()
         email = str(cfg.get("author_email", "")).strip()
         git_args = ["commit", "-m", message]
@@ -1749,8 +1768,6 @@ class RepoService:
         log(out.splitlines()[-1] if out else "Коммит создан.")
 
         sha = self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir)
-        log_event("commit_started", branch=branch, message=message, auto=auto)
-        log_event("sync_files", copied=n, deleted_extra=bool(cfg.get("delete_extra", False)))
 
         # Записываем историю и фиксируем успех ДО push — чтобы ошибка/неудача
         # пуша не маскировала уже созданный коммит.
@@ -1841,8 +1858,12 @@ class RepoService:
         do_clean = bool(extras) and bool(cfg.get("delete_extra", False))
         if extras and do_clean and confirm is not None:
             do_clean = bool(confirm(str(target_path)))
-        if extras and do_clean and not confirm_delete_allowed(do_clean, len(extras)):
-            do_clean = False
+        elif extras and do_clean and confirm is None \
+                and needs_extra_confirmation(len(extras)):
+            # Авто-режим (без диалога): массовое удаление не блокируем,
+            # но предупреждаем в логе (ТЗ v4, задача 1.5).
+            log(f"Внимание: автоматически удаляется лишних файлов: "
+                f"{len(extras)} (> {DELETE_CONFIRM_THRESHOLD}).")
         if extras and not do_clean and cfg.get("delete_extra", False):
             log(f"Удаление лишних файлов в «{target_path}» отменено "
                 f"(осталось {len(extras)} объектов).")
@@ -2020,7 +2041,7 @@ class RepoService:
                 with tempfile.TemporaryDirectory(prefix="gcsim_") as tmp:
                     sim = Path(tmp) / "wd"
                     sim.mkdir()
-                    FileSync._default_fs.copy_repo_items(local, sim)
+                    self.fs.copy_repo_items(local, sim)
                     self.fs.into_repo(source, sim,
                                       delete_extra=bool(cfg.get("delete_extra", False)))
                     shutil.copytree(local / ".git", sim / ".git")
@@ -2757,6 +2778,13 @@ class MainWindow:
 
         # контекстные меню на полях ввода (ПКМ)
         self._entry_menu = self._build_entry_menu()
+        # маппинг виджет → StringVar для контекстного меню (ТЗ v4, 3.1)
+        self._ctx_vars = {
+            self._w_folder:   self.var_folder,
+            self.var_repo:    self.var_repo.var,
+            self._w_download: self.var_download,
+            self.cmb_branch:  self.var_branch,
+        }
         for w in (self._w_folder, self.var_repo, self._w_download,
                   self.cmb_branch):
             # ПКМ: Windows/Linux — Button-3; macOS — Button-2 или Ctrl+ЛКМ
@@ -3015,19 +3043,35 @@ class MainWindow:
         finally:
             self._entry_menu.grab_release()
 
+    def _ctx_var(self):
+        if self._ctx_target is None:
+            return None
+        return self._ctx_vars.get(self._ctx_target)
+
     def _ctx_get(self) -> str:
-        target = self._ctx_target
-        if target is None:
+        var = self._ctx_var()
+        if var is None:
             return ""
-        # getattr(..., False) — на случай виджета без механизма плейсхолдера
+        # пока показывается плейсхолдер — считаем поле пустым
+        target = self._ctx_target
         if getattr(target, "_showing_ph", False):
             return ""
-        return target.get()
+        return var.get()
 
     def _ctx_set(self, value) -> None:
-        if self._ctx_target is None:
+        var = self._ctx_var()
+        if var is None:
             return
-        self._ctx_target.set(value)
+        var.set(value)
+        # синхронизируем состояние плейсхолдера (PlaceholderEntry)
+        target = self._ctx_target
+        hide = getattr(target, "_hide_placeholder", None)
+        show = getattr(target, "_show_placeholder", None)
+        if hide and show:
+            if value:
+                hide()
+            else:
+                show()
         self._on_settings_change()
 
     def _ctx_paste(self) -> None:
@@ -3781,15 +3825,20 @@ def main() -> None:
     assert tk is not None
     root = tk.Tk()
     app = MainWindow(root)
-    if isinstance(ver, tuple) and len(ver) == 2:
+    # FIX-1.3: поддерживаем три формы ответа version():
+    #   (int, int) — распознанная версия;
+    #   str        — нестандартный вывод git --version;
+    #   ()         — не удалось определить (сюда не попадаем: git уже найден).
+    if (isinstance(ver, tuple) and len(ver) == 2
+            and all(isinstance(x, int) for x in ver)):
         if ver < GIT_MIN_VERSION:
             app.log(f"ВНИМАНИЕ: версия git {ver[0]}.{ver[1]} ниже "
                     f"рекомендованной {GIT_MIN_VERSION[0]}.{GIT_MIN_VERSION[1]} "
                     "— возможны проблемы.")
         else:
             app.log(f"git {ver[0]}.{ver[1]} — OK")
-    elif ver:
-        app.log(str(ver[0]) if isinstance(ver, tuple) else ver)
+    elif isinstance(ver, str) and ver:
+        app.log(f"git: {ver}")
     root.mainloop()
 
 
