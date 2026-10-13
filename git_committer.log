@@ -1,0 +1,1 @@
+2026-10-13 22:25:41,464 [WARNING] Не удалось заменить «/tmp/fix3_test/dst2» ([Errno 2] No such file or directory: '/nonexistent-xyz/aa')
