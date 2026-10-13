@@ -2105,7 +2105,7 @@ class RepoService:
     # ------------------------------------------------------------------ #
 
     def download(self, cfg: Any, log: Callable[[str], None],
-                 confirm: Optional[Callable[[str], bool]] = None) -> str:
+                 confirm: Optional[Callable[[Path], bool]] = None) -> str:
         """Клон/fetch/checkout/pull → выгрузка рабочей копии (без .git)
         в download_folder (или source_folder) → удаление лишних файлов
         (с подтверждением confirm в GUI, безусловно в авто).
@@ -2742,7 +2742,7 @@ class LogPanel:
     # Пути: абсолютные unix/windows и относительные с разделителем.
     _RE_PATH = re.compile(
         r"(?:^|(?<=[\s:()<>\u201c\u00ab]))"
-        r"((?:[A-Za-z]:[\\/][^\s:,;)\]]+|/[^\s:,;)\][]+/[^\s:,;)\]]*))")
+        r"((?:[A-Za-z]:[\\/]\S+|/\S+/)[^\s:,;)\]]*)")
     # SHA: 7–40 hex, рядом со словом sha/commit/hash или одинокий токен.
     _RE_SHA = re.compile(r"(?<![0-9a-fA-F])([0-9a-f]{7,40})(?![0-9a-fA-F])")
     _RE_ERROR = re.compile(r"(fatal:|error:|ERROR|Traceback)", re.IGNORECASE)
@@ -2806,7 +2806,7 @@ class LogPanel:
     def _highlight_line(self, start: str, end: str, msg: str) -> None:
         """Раскрасить вставленную строку по regex (v5, п.4)."""
         t = self.text
-        offset = len(t.line_start(start))  # длина префикса «[HH:MM:SS] »
+        offset = 12  # длина префикса «[HH:MM:SS] »
         body_start = f"{start} + {offset} chars"
         if self._RE_ERROR.search(msg):
             t.tag_add("errline", start, end)
@@ -2834,12 +2834,14 @@ class LogPanel:
     def _token_at(self, index: str, tag: str) -> str:
         """Текст тега под курсором (для обработчиков кликов)."""
         t = self.text
-        ranges = [r for r in t.tag_ranges(tag)
-                  if t.compare(f"{index} >= {r[0]}", "and",
-                               f"{index} <= {r[1]}")]
+        ranges = t.tag_ranges(tag)
         if not ranges:
             return ""
-        return t.get(ranges[0][0], ranges[0][1]).strip()
+        for i in range(0, len(ranges), 2):
+            r_start, r_end = ranges[i], ranges[i + 1]
+            if t.compare(index, ">=", r_start) and t.compare(index, "<=", r_end):
+                return t.get(r_start, r_end).strip()
+        return ""
 
     def _on_path_click(self, event) -> None:
         index = self.text.index(f"@{event.x},{event.y}")
@@ -3156,6 +3158,12 @@ class MainWindow:
         self._force_quit = False
         self._tt = {}                            # тултипы полей
 
+        # Единая BooleanVar для чекбоксов авто-коммита (главная + настройки).
+        # Инициализируется ДО _build_ui(), чтобы оба чекбокса могли
+        # привязаться к одной переменной (см. ТЗ, задача 1.1 / эпик 4.1).
+        self.var_auto_commit = tk.BooleanVar(value=bool(self.cfg.get("auto_commit")))
+        self.var_auto_clone = tk.BooleanVar(value=bool(self.cfg.get("auto_clone")))
+
         if self.cfg.get("auto_commit"):
             self.scheduler.toggle("commit", True)
         if self.cfg.get("auto_clone"):
@@ -3371,8 +3379,8 @@ class MainWindow:
         quick_auto = ttk.Frame(home)
         _p(quick_auto, fill="x", pady=(8, 0))
         ttk.Checkbutton(quick_auto, text="⏱ Авто-коммит",
-                        variable=self.var_auto_commit_pre,
-                        command=lambda: self._quick_toggle_auto()).pack(side="left")
+                        variable=self.var_auto_commit,
+                        command=lambda: self._toggle_auto("commit")).pack(side="left")
         self.lbl_next_main = ttk.Label(quick_auto, text="", width=26)
         self.lbl_next_main.pack(side="right")
 
@@ -3391,8 +3399,8 @@ class MainWindow:
         auto_frame.pack(fill="x", pady=(2, 0))
         self.auto_frame = auto_frame
 
-        self.var_auto_commit = tk.BooleanVar(value=bool(cfg.get("auto_commit")))
-        self.var_auto_clone = tk.BooleanVar(value=bool(cfg.get("auto_clone")))
+        # var_auto_commit / var_auto_clone уже созданы в __init__
+        # (до _build_ui) — оба чекбокса привязаны к одной переменной.
 
         self.lbl_next_commit = ttk.Label(auto_frame, text="—", width=22)
         self.lbl_next_download = ttk.Label(auto_frame, text="—", width=22)
@@ -3660,11 +3668,6 @@ class MainWindow:
             self.home.pack_forget()
             self.empty_state.pack(fill="both", expand=True,
                                   before=self.log_panel.text)
-
-    def _quick_toggle_auto(self) -> None:
-        """Тогглер авто-коммита на главной синхронизирует чекбокс настроек."""
-        self.var_auto_commit.set(bool(self.var_auto_commit_pre.get()))
-        self._toggle_auto("commit")
 
     def _setup_dnd(self) -> None:
         """Drag&Drop: папка из проводника → «Папка»/«Папка выгрузки»,
@@ -4609,14 +4612,12 @@ class MainWindow:
 
     def _refresh_buttons(self) -> None:
         state = "normal" if not self.tasks.busy else "disabled"
-        self.btn_commit.configure(
+        self.btn_commit.configure_btn(
             state=state,
-            bg="#1f8b4c" if not self.tasks.busy else "#9e9e9e",
-            fg="white")
-        self.btn_download.configure(
+            bg="#1f8b4c" if not self.tasks.busy else "#9e9e9e")
+        self.btn_download.configure_btn(
             state=state,
-            bg="#2b6cb0" if not self.tasks.busy else "#9e9e9e",
-            fg="white")
+            bg="#2b6cb0" if not self.tasks.busy else "#9e9e9e")
         for b in (getattr(self, "btn_test_conn", None),
                   getattr(self, "btn_branches", None)):
             if b is not None:
