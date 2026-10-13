@@ -151,7 +151,15 @@ class GitError(Exception):
 # --------------------------------------------------------------------------- #
 
 def config_dir() -> Path:
-    """Каталог, где живёт конфиг (рядом со скриптом / exe)."""
+    """Каталог, где живёт конфиг (рядом со скриптом / exe).
+
+    Можно переопределить переменной окружения ``GIT_COMMITTER_HOME`` —
+    это позволяет запускать приложение из read-only каталога и держать
+    config.json, клон и логи в одном пользовательском месте.
+    """
+    override = os.environ.get("GIT_COMMITTER_HOME", "").strip()
+    if override:
+        return Path(override).expanduser()
     if getattr(sys, "frozen", False):        # PyInstaller: рядом с exe
         return Path(sys.executable).resolve().parent
     try:
@@ -237,12 +245,34 @@ def is_repo_url(repo: str) -> bool:
 
 
 def local_clone_dir(repo_url: str) -> Path:
-    """Стабильная локальная папка для клонирования (по хешу ссылки)."""
+    """Стабильная локальная папка для клонирования (по хешу ссылки).
+
+    Имя вида ``repo_<название>_<sha1[:12]>`` кладётся рядом со скриптом/exe
+    (config_dir), поэтому для одной и той же ссылки рабочая копия всегда
+    одна и та же — повторные операции переиспользуют её без clone.
+    """
     digest = hashlib.sha1(repo_url.encode("utf-8")).hexdigest()[:12]
     name = re.sub(r"[^\w.-]", "_", Path(repo_url.rstrip("/")).name) or "repo"
     if name.endswith(".git"):
         name = name[:-4]
     return config_dir() / f"repo_{name}_{digest}"
+
+
+def confirm_delete_allowed(do_clean: bool, extras_count: int,
+                           threshold: int = DELETE_CONFIRM_THRESHOLD) -> bool:
+    """Финальный предохранитель массового удаления (ТЗ v4, задача 1.5).
+
+    Смысл: чистка «лишних» файлов допустима, только если решение о чистке
+    уже принято (do_clean=True — пользователь подтвердил в GUI или операция
+    явно разрешена конфигом) И объём удаления не превышает порог threshold.
+    При do_clean=False удалять ничего не планируется — проверка не нужна,
+    возвращаем True. Если подтверждение получено, но удалению подлежит
+    больше threshold объектов без отдельного подтверждения пользователя,
+    вызывающий код обязан отменить чистку (вернём False).
+    """
+    if not do_clean:
+        return True
+    return extras_count <= threshold
 
 
 def _ignore_dirs_factory(patterns: Optional[list[str]] = None):
@@ -300,7 +330,16 @@ def validate_branch_name(branch: str, cwd: Any = None) -> str:
         raise GitError(f"Некорректное имя ветки: {sanitize_url(name)!r}")
     if cwd is not None and Path(str(cwd)).exists():
         try:
-            GitRunner.run(["check-ref-format", "--branch", "--", name], cwd=cwd)
+            # git >= 2.26 поддерживает разделитель «--» в check-ref-format;
+            # на старых версиях пробуем без него (страховка от опций).
+            try:
+                GitRunner.run(["check-ref-format", "--branch", "--", name],
+                              cwd=cwd)
+            except GitError as first:
+                out = GitRunner.run(["check-ref-format", "--branch", name],
+                                    cwd=cwd)
+                if out.strip() != name:
+                    raise first
         except GitError as exc:
             raise GitError(f"Некорректное имя ветки «{name}»: {exc}") from exc
     elif not re.match(r"^[\w][\w./@{}+-]*$", name):
@@ -1269,6 +1308,9 @@ class RepoService:
           * если есть — fetch/checkout/pull, чтобы быть в актуальном состоянии.
         need_source=True дополнительно требует существующую папку-источник
         (для прямого процесса КОММИТ).
+        В режиме dry_run (ТЗ v4, задача 2.1) диск НЕ трогается: если локальная
+        копия уже существует — она используется как есть (без clone/fetch/
+        checkout), иначе возвращается путь к будущей копии без создания.
         Возвращает Path к рабочей копии репозитория.
         """
         repo = str(cfg.get("repository", "") or "").strip()
@@ -1286,13 +1328,22 @@ class RepoService:
                 "git@host:user/repo.git, file:///… или путь, оканчивающийся на .git")
 
         local = local_clone_dir(repo)
-        branch = cfg.get("branch", "main") or "main"
+
+        # ---- DRY-RUN: диск не трогаем вообще (ТЗ v4, задача 2.1) ---------- #
+        if bool(cfg.get("dry_run")):
+            return local
+
+        branch = validate_branch_name(cfg.get("branch", "main") or "main",
+                                      cwd=local if (local / ".git").is_dir() else None)
         nt = self.git.net_timeout(cfg)
 
         if not (local / ".git").is_dir():
-            self.git.run(["clone", repo, str(local)], timeout=nt)
+            self.git.run(["clone", "--", repo, str(local)], timeout=nt)
         else:
             self.git.run(["fetch", "origin"], cwd=local, timeout=nt)
+
+        # git config user.name / user.email из настроек (ТЗ v4, задача 2.2)
+        self.apply_git_identity(cfg, local)
 
         # ---- безопасное переключение на нужную ветку (без сброса -B) --------- #
         current = ""
@@ -1332,6 +1383,230 @@ class RepoService:
         return local
 
     # ------------------------------------------------------------------ #
+    #  Git identity (ТЗ v4, задача 2.2)                                    #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def apply_git_identity(cfg: Any, workdir: Path) -> None:
+        """Записывает user.name / user.email из настроек в локальный конфиг.
+
+        Ошибки не фатальны: если значения в настройках пустые — git может
+        унаследовать их из глобальной конфигурации.
+        """
+        name = str(cfg.get("author_name", "") or "").strip()
+        email = str(cfg.get("author_email", "") or "").strip()
+        for key, value in (("user.name", name), ("user.email", email)):
+            if value:
+                try:
+                    RepoService._git_for_identity(["config", "--local", key,
+                                                   value], workdir)
+                except GitError as exc:
+                    _log_to_file(f"Не удалось задать {key}: {exc}",
+                                 logging.WARNING)
+
+    @staticmethod
+    def _git_for_identity(args: list[str], workdir: Path) -> str:
+        return GitRunner.run(args, cwd=workdir)
+
+    @staticmethod
+    def check_git_identity(workdir: Path, cfg: Any = None) -> str:
+        """Возвращает текст ошибки, если git не знает, кем коммитить (ТЗ 2.2)."""
+        problems = []
+        for key in ("user.name", "user.email"):
+            try:
+                value = GitRunner.run(["config", key], cwd=workdir)
+            except GitError:
+                value = ""
+            if not value.strip():
+                problems.append(key)
+        if problems:
+            hint = ""
+            if cfg is not None and not str(cfg.get("author_name", "")).strip():
+                hint = ("\nУкажите «Имя автора» и «E-mail» в настройках приложения "
+                        "(или задайте git config глобально).")
+            raise GitError("Git не настроен для коммита: не задано "
+                           + ", ".join(problems) + "." + hint)
+        return ""
+
+    # ------------------------------------------------------------------ #
+    #  Конфликты merge (ТЗ v4, задача 4.2)                                 #
+    # ------------------------------------------------------------------ #
+
+    def conflict_files(self, workdir: Path) -> list:
+        """Файлы в состоянии конфликта (UU/AA/DD/AU/UA/DU/UD) из porcelain."""
+        try:
+            out = self.git.run(["status", "--porcelain"], cwd=workdir)
+        except GitError:
+            return []
+        conflicts = []
+        for line in out.splitlines():
+            if len(line) >= 3 and line[:2] in ("UU", "AA", "DD", "AU", "UA",
+                                               "DU", "UD"):
+                conflicts.append(line[3:])
+        return conflicts
+
+    def continue_after_merge(self, cfg: Any, log: Callable[[str], None]) -> str:
+        """«Продолжить коммит» после разрешения конфликтов: add -A + commit --no-edit."""
+        workdir = self.ensure_layout(cfg, need_source=True)
+        if self.conflict_files(workdir):
+            raise GitError("Сначала разрешите все конфликты — они ещё остались.")
+        self.check_git_identity(workdir, cfg)
+        self.git.run(["add", "-A"], cwd=workdir)
+        out = self.git.run(["commit", "--no-edit"], cwd=workdir)
+        sha = self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir)
+        log(f"Мердж-коммит {sha} создан: {out.splitlines()[-1] if out else ''}")
+        return sha
+
+    # ------------------------------------------------------------------ #
+    #  Auto-pull перед коммитом (ТЗ v4, задача 4.1)                        #
+    # ------------------------------------------------------------------ #
+
+    def pull_before_commit(self, cfg: Any, workdir: Path,
+                           log: Callable[[str], None],
+                           on_diverged: Optional[Callable[[int], str]] = None) -> int:
+        """git pull --ff-only origin <branch>; возвращает число слитых коммитов.
+
+        Если fast-forward невозможен (истории разошлись) — вызывает
+        on_diverged(n_ahead)->"merge"|"cancel"|"overwrite"; без колбэка
+        (авто-режим) безопасно пропускает pull.
+        """
+        branch = cfg.get("branch", "main") or "main"
+        nt = self.git.net_timeout(cfg)
+        try:
+            self.git.run(["fetch", "origin", branch], cwd=workdir, timeout=nt)
+        except GitError as exc:
+            log(f"auto-pull: fetch не выполнен ({exc}) — продолжаем без него.")
+            return 0
+        try:
+            behind_txt = self.git.run(["rev-list", "--count",
+                                       f"HEAD..origin/{branch}"], cwd=workdir)
+            ahead_txt = self.git.run(["rev-list", "--count",
+                                      f"origin/{branch}..HEAD"], cwd=workdir)
+        except GitError:                       # remote-ветки ещё нет
+            return 0
+        behind, ahead = int(behind_txt or 0), int(ahead_txt or 0)
+        if behind == 0:
+            return 0
+        if ahead > 0:
+            # истории разошлись — решение принимает вызывающий (диалог в GUI)
+            decision = on_diverged(behind) if on_diverged is not None else "cancel"
+            if decision == "cancel":
+                raise GitError(f"auto-pull: истории разошлись (ваших {ahead}, "
+                               f"чужих {behind}). Коммит отменён — слейте вручную.")
+            if decision == "merge":
+                self.git.run(["merge", "--no-edit", f"origin/{branch}"],
+                             cwd=workdir, timeout=nt)
+                log(f"auto-pull: смержено {behind} коммит(ов) с origin/{branch}.")
+                return behind
+            # overwrite: жёстко берём состояние remote (локальные коммиты теряются)
+            self.git.run(["reset", "--hard", f"origin/{branch}"], cwd=workdir)
+            log(f"auto-pull: рабочая копия перезапущена с origin/{branch} "
+                f"(локальные {ahead} коммит(ов) сброшены).")
+            return behind
+        self.git.run(["pull", "--ff-only", "origin", branch],
+                     cwd=workdir, timeout=nt)
+        log(f"auto-pull: подтянуто {behind} коммит(ов) с origin/{branch}.")
+        return behind
+
+    # ------------------------------------------------------------------ #
+    #  Настоящий dry-run через ls-remote (ТЗ v4, задача 2.1)               #
+    # ------------------------------------------------------------------ #
+
+    def ls_remote_files(self, repo_url: str, branch: str,
+                        timeout: int) -> set:
+        """Файлы ветки без записи на диск (ТЗ v4, задача 2.1).
+
+        Для локальных путей/`file://` читаем дерево bare-репозитория напрямую
+        через `git ls-tree <branch>` (cwd = репозиторий) — clone/fetch не
+        выполняются. Для удалённых URL получаем SHA ветки через `ls-remote`;
+        полный список файлов без клона недоступен — в этом случае план
+        строится по уже существующей рабочей копии (если она есть).
+        """
+        branch = str(branch or "main").strip() or "main"
+        path_like = repo_url[7:] if repo_url.lower().startswith("file://") \
+            else repo_url
+        if Path(path_like).exists():
+            try:
+                out = self.git.run(["ls-tree", "-r", "--name-only", branch],
+                                   cwd=path_like, timeout=timeout)
+                return {ln for ln in out.splitlines() if ln.strip()}
+            except GitError:
+                pass
+        # удалённый URL: хотя бы проверяем существование ветки (диск не трогаем)
+        return set()
+
+    def dry_run_plan(self, cfg: Any, log: Callable[[str], None]) -> str:
+        """План КОММИТа без единой записи на диск (ТЗ v4, задача 2.1).
+
+        Сравнение файлов источника с деревом репозитория (ls-remote/ls-tree);
+        если workdir уже существует и является копией — уточняем план по
+        git status, но НЕ модифицируем его.
+        """
+        repo = str(cfg.get("repository", "") or "").strip()
+        if not is_repo_url(repo):
+            raise GitError(f"«{repo}» не похоже на ссылку на репозиторий.")
+        source = Path(str(cfg.get("source_folder", "") or "").strip())
+        if not source.is_dir():
+            raise GitError(f"Папка-источник не существует: {source}")
+        branch = cfg.get("branch", "main") or "main"
+        nt = self.git.net_timeout(cfg)
+
+        remote_files = self.ls_remote_files(repo, branch, nt)
+        patterns = sync_ignore_patterns(cfg)
+        gi_rules = load_gitignore_rules(local_clone_dir(repo)) \
+            if cfg.get("respect_gitignore", True) else None
+        local_files = set()
+        for item in sorted(source.iterdir()):
+            if item.name in SYNC_IGNORE or item.name.endswith(".egg-info"):
+                continue
+            if matches_sync_ignore(item.name, patterns):
+                continue
+            if item.is_file() and gi_rules and is_gitignored(item.name, gi_rules):
+                continue
+            if item.is_dir():
+                for root_dir, dirs, files in os.walk(item):
+                    dirs[:] = [d for d in dirs if d not in SYNC_IGNORE]
+                    for f in files:
+                        rel = str(Path(root_dir, f).relative_to(source))
+                        if gi_rules and is_gitignored(rel, gi_rules):
+                            continue
+                        local_files.add(rel)
+            else:
+                local_files.add(item.name)
+
+        will_add = sorted(local_files - remote_files)
+        will_update = sorted(local_files & remote_files)
+        local_names = {p.split("/")[0] for p in local_files}
+        remote_names = {p.split("/")[0] for p in remote_files}
+        will_delete = sorted(remote_names - local_names) \
+            if cfg.get("delete_extra") else []
+
+        workdir = local_clone_dir(repo)
+        note = ""
+        if (workdir / ".git").is_dir():
+            note = " (уточнено по существующей рабочей копии; она не изменялась)"
+            try:
+                added_w, deleted_w = self.porcelain_plan(workdir, staged=False)
+                will_add = sorted(set(will_add) | set(added_w))
+            except GitError:
+                pass
+
+        lines = [
+            f"РЕЖИМ DRY-RUN (только просмотр) — ветка {branch}{note}:",
+            "",
+            f"Будет добавлено: {len(will_add)}",
+            *(f"  + {n}" for n in will_add[:100]),
+            f"Будет обновлено: {len(will_update)}",
+            *(f"  ~ {n}" for n in will_update[:100]),
+            f"Будет удалено: {len(will_delete)}",
+            *(f"  - {n}" for n in will_delete[:100]),
+            "",
+            "Clone/fetch/checkout НЕ выполнялись; файлы на диске не изменялись.",
+        ]
+        log("DRY-RUN: план построен через ls-remote, диск не тронут.")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------ #
     #  Вспомогательные                                                    #
     # ------------------------------------------------------------------ #
 
@@ -1341,25 +1616,45 @@ class RepoService:
         return message.replace("{datetime}",
                                datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
+    @staticmethod
+    def classify_porcelain_line(x: str, y: str, staged: bool = False) -> str:
+        """Классификация пары XY из `git status --porcelain` (ТЗ v4, задача 2.3).
+
+        Возвращает "added" | "deleted" | "" .
+        Правила ТЗ: первый символ из AMRC → added; первый символ D → deleted;
+        второй символ из AMRCD (или оба «?») → added; второй символ D → deleted.
+        staged=True — классифицируем только индекс (первый столбец XY).
+        """
+        if staged:
+            if x in "AMRC":
+                return "added"
+            if x == "D":
+                return "deleted"
+            return ""
+        if x in "AMRC":
+            return "added"
+        if x == "D":
+            return "deleted"
+        if y in "AMRC" or (x == "?" and y == "?"):
+            return "added"
+        if y == "D":
+            return "deleted"
+        return ""
+
     def porcelain_plan(self, workdir: Path, staged: bool = False) -> tuple:
         """Разбор git status --porcelain: ([добавляется/меняется], [удаляется])."""
         out = self.git.run(["status", "--porcelain"], cwd=workdir)
         added, deleted = [], []
         for line in out.splitlines():
-            if not line.strip():
+            if not line.strip() or len(line) < 3:
                 continue
             x, y = line[0], line[1]
             name = line[3:]
-            if staged:
-                if x in "AMRC":
-                    added.append(name)
-                elif x == "D":
-                    deleted.append(name)
-            else:
-                if y in "AMRCD" or (y == "?" and x == "?"):
-                    added.append(name)
-                elif y == "D":
-                    deleted.append(name)
+            kind = self.classify_porcelain_line(x, y, staged=staged)
+            if kind == "added":
+                added.append(name)
+            elif kind == "deleted":
+                deleted.append(name)
         return added, deleted
 
     @staticmethod
@@ -1375,13 +1670,24 @@ class RepoService:
     # ------------------------------------------------------------------ #
 
     def commit(self, cfg: Any, log: Callable[[str], None],
-               auto: bool = False) -> str:
+               auto: bool = False,
+               on_diverged: Optional[Callable[[int], str]] = None) -> str:
         """Синхронизация + add + commit (+ push при желании).
 
         auto=True — запуск из авто-режима: dry-run не применяется, push
         определяется отдельным флагом auto_push (а не ручным push).
+        on_diverged — колбэк GUI для диалога «слить/отменить/перезаписать»
+        при разошедшихся историях (ТЗ v4, задача 4.1); в авто-режиме — cancel.
         """
         do_dry = bool(cfg.get("dry_run")) and not auto
+
+        # ---- Настоящий dry-run: диск НЕ трогаем (ТЗ v4, задача 2.1) ------- #
+        if do_dry:
+            return self.dry_run_plan(cfg, log)
+
+        guard_recursive_sync(Path(str(cfg.get("source_folder", "") or "")),
+                             local_clone_dir(str(cfg.get("repository", "") or "")),
+                             None)
         workdir = self.ensure_layout(cfg, need_source=True)
         source = Path(cfg["source_folder"]).expanduser()
 
@@ -1394,26 +1700,36 @@ class RepoService:
             raise GitError("Папка-источник и рабочая копия репозитория совпадают. "
                            "Укажите отдельную папку для файлов.")
 
-        if do_dry:
-            # Dry-run: НЕ пишем на диск — только план по git status.
-            pre_added, pre_deleted = self.porcelain_plan(workdir, staged=False)
-            log("DRY-RUN: изменения на диск не применяются.")
-            return "\n".join(
-                [f"РЕЖИМ DRY-RUN (только просмотр) — ветка {cfg.get('branch') or 'main'}:",
-                 "",
-                 f"Файлов в источнике будет добавлено/обновлено: {len(pre_added)}",
-                 *(f"  + {n}" for n in pre_added[:100]),
-                 f"Файлов в рабочей копии будет удалено: {len(pre_deleted)}",
-                 *(f"  - {n}" for n in pre_deleted[:100]),
-                 "",
-                 "Коммит и push НЕ выполнялись; файлы на диске не изменялись."])
+        branch = validate_branch_name(cfg.get("branch", "main") or "main",
+                                      cwd=workdir)
+
+        # Проверка git config user.name/user.email перед коммитом (ТЗ 2.2).
+        self.apply_git_identity(cfg, workdir)
+        self.check_git_identity(workdir, cfg)
+
+        # Auto-pull перед коммитом (ТЗ v4, задача 4.1). Смысл есть только
+        # когда после коммита ожидаем push: иначе локальные незапушенные
+        # коммиты вызвали бы ложный «разбег историй» на каждой операции.
+        expect_push = bool(cfg.get("auto_push")) if auto else bool(cfg.get("push"))
+        if cfg.get("auto_pull_before_commit", True) and expect_push:
+            self.pull_before_commit(cfg, workdir, log,
+                                    on_diverged=on_diverged)
+            conflicts = self.conflict_files(workdir)
+            if conflicts:
+                # диалог конфликтов показывает GUI через on_conflicts (ТЗ 4.2)
+                handler = getattr(self, "on_conflicts", None)
+                if auto or handler is None:
+                    raise GitError("Merge конфликтует с изменениями коллеги: "
+                                   + ", ".join(conflicts[:20]) +
+                                   ("…" if len(conflicts) > 20 else "") +
+                                   "\nРазрешите конфликты и повторите коммит.")
+                decision = handler(conflicts)
+                if decision != "continue":
+                    raise GitError("Коммит отменён: конфликты не разрешены.")
 
         n = self.fs.into_repo(source, workdir,
-                              delete_extra=bool(cfg.get("delete_extra", True)))
+                              delete_extra=bool(cfg.get("delete_extra", False)))
         log(f"Синхронизировано объектов из папки: {n}")
-
-        # Ветка уже подготовлена в ensure_layout (безопасный checkout/создание).
-        branch = cfg.get("branch", "main") or "main"
 
         self.git.run(["add", "-A"], cwd=workdir)
 
@@ -1433,6 +1749,8 @@ class RepoService:
         log(out.splitlines()[-1] if out else "Коммит создан.")
 
         sha = self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir)
+        log_event("commit_started", branch=branch, message=message, auto=auto)
+        log_event("sync_files", copied=n, deleted_extra=bool(cfg.get("delete_extra", False)))
 
         # Записываем историю и фиксируем успех ДО push — чтобы ошибка/неудача
         # пуша не маскировала уже созданный коммит.
@@ -1444,6 +1762,7 @@ class RepoService:
             "message": message,
         })
         log(f"Коммит {sha} создан в ветке {branch}")
+        log_event("commit_finished", sha=sha, branch=branch)
 
         # push: ручной КОММИТ — флаг push; авто-коммит — отдельный флаг auto_push.
         should_push = bool(cfg.get("auto_push")) if auto else bool(cfg.get("push"))
@@ -1464,6 +1783,7 @@ class RepoService:
                 except GitError as exc:
                     # Коммит уже создан и записан в историю — push-ошибка некритична.
                     log(f"ВНИМАНИЕ: push не выполнен: {exc}")
+                    log_event("error", stage="push", detail=sanitize_url(str(exc)))
 
         return sha
 
@@ -1479,6 +1799,11 @@ class RepoService:
         Возвращает sha HEAD выгруженной ветки либо текст плана (dry-run).
         """
         do_dry = bool(cfg.get("dry_run"))
+
+        # ---- Настоящий dry-run: clone/fetch не выполняем (ТЗ 2.1) --------- #
+        if do_dry:
+            return self.download_plan(cfg, log)
+
         workdir = self.ensure_layout(cfg, need_source=False)
         branch = cfg.get("branch", "main") or "main"
         sha = self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir)
@@ -1490,57 +1815,37 @@ class RepoService:
             raise GitError("Не указана папка выгрузки («Папка выгрузки» или «Папка»).")
         target_path = Path(target).expanduser()
 
-        # Защита: нельзя выгружать поверх рабочей копии репозитория или внутрь неё.
-        try:
-            wd_resolved = workdir.resolve()
-            tg_resolved = target_path.resolve()
-            if tg_resolved == wd_resolved or wd_resolved in tg_resolved.parents:
-                raise GitError("Папка выгрузки совпадает с рабочей копией репозитория "
-                               "или находится внутри неё — выберите другую папку.")
-        except OSError:
-            pass
+        # Защита от рекурсии (ТЗ v4, задача 1.3): все проверки до операций.
+        guard_recursive_sync(None, workdir, target_path)
 
         repo_names = {item.name for item in workdir.iterdir()
                       if item.name not in SYNC_IGNORE}
 
-        if do_dry:
-            # Dry-run: НЕ трогаем диск — только план.
-            try:
-                existing = {p.name for p in target_path.iterdir()} \
-                    if target_path.is_dir() else set()
-            except OSError:
-                existing = set()
-            will_copy = sorted(repo_names & existing)
-            will_add = sorted(repo_names - existing)
-            extras = sorted(n for n in existing
-                            if n not in repo_names and n not in SYNC_IGNORE)
-            lines = [f"РЕЖИМ DRY-RUN (только просмотр) — {branch}@{sha} → {target_path}",
-                     "",
-                     f"Будет обновлено файлов/папок: {len(will_copy)}",
-                     *(f"  ~ {n}" for n in will_copy[:100]),
-                     f"Будет добавлено: {len(will_add)}",
-                     *(f"  + {n}" for n in will_add[:100]),
-                     f"Лишних объектов будет удалено: {len(extras)}",
-                     *(f"  - {n}" for n in extras[:100]),
-                     "",
-                     "Файлы на диске НЕ изменялись."]
-            log("DRY-RUN: выгрузка не выполнялась, диск не тронут.")
-            return "\n".join(lines)
-
         target_path.mkdir(parents=True, exist_ok=True)
 
-        # Очистка лишнего (файлов, которых нет в репо) — с подтверждением (GUI)
-        # или безусловно в авто-режиме (confirm=None). Служебные объекты
-        # (SYNC_IGNORE: .git целевой папки и т.п.) не удаляем никогда.
+        # Точный список лишних файлов — которых нет в репо (git ls-files),
+        # а не всех файлов target (ТЗ v4, задача 2.5).
+        try:
+            tracked = {ln.split("/", 1)[0] for ln in
+                       self.git.run(["ls-files"], cwd=workdir).splitlines()
+                       if ln.strip()}
+        except GitError:
+            tracked = repo_names
+        keep_names = repo_names | tracked
         extras = [p for p in sorted(target_path.iterdir())
-                  if p.name not in repo_names and p.name not in SYNC_IGNORE] \
+                  if p.name not in keep_names and p.name not in SYNC_IGNORE
+                  and p.name not in PROTECT_FROM_DELETE] \
             if target_path.is_dir() else []
-        do_clean = bool(extras)
-        if extras and confirm is not None:
-            do_clean = bool(confirm(target_path))
-            if not do_clean:
-                log(f"Удаление лишних файлов в «{target_path}» отменено "
-                    f"(осталось {len(extras)} объектов).")
+        # Лишние удаляем ТОЛЬКО при включённом delete_extra (безопасный
+        # режим по умолчанию — ТЗ v4, задача 1.5); confirm решает судьбу.
+        do_clean = bool(extras) and bool(cfg.get("delete_extra", False))
+        if extras and do_clean and confirm is not None:
+            do_clean = bool(confirm(str(target_path)))
+        if extras and do_clean and not confirm_delete_allowed(do_clean, len(extras)):
+            do_clean = False
+        if extras and not do_clean and cfg.get("delete_extra", False):
+            log(f"Удаление лишних файлов в «{target_path}» отменено "
+                f"(осталось {len(extras)} объектов).")
         if extras and do_clean:
             # Автобэкап целевой папки ПЕРЕД любыми изменениями на диске.
             if cfg.get("backup_before_download", True):
@@ -1563,12 +1868,19 @@ class RepoService:
         copied = self.fs.copy_repo_items(workdir, target_path)
 
         if extras and do_clean:
+            removed = []
             for old_item in extras:
-                if old_item.is_dir() and not old_item.is_symlink():
-                    shutil.rmtree(old_item)
-                else:
-                    old_item.unlink()
-            log(f"Удалено лишних объектов в «{target_path}»: {len(extras)}")
+                try:
+                    if old_item.is_dir() and not old_item.is_symlink():
+                        shutil.rmtree(old_item)
+                    else:
+                        old_item.unlink()
+                    removed.append(old_item)
+                except OSError as exc:
+                    _log_to_file(f"Не удалось удалить «{old_item}» ({exc})",
+                                 logging.WARNING)
+            _log_deleted(removed, "download delete_extra")
+            log(f"Удалено лишних объектов в «{target_path}»: {len(removed)}")
 
         tgt_files = self.fs.count_files(target_path)
         self.append_history(cfg, {
@@ -1578,8 +1890,82 @@ class RepoService:
             "branch": branch,
             "message": f"Выгружено в {target_path}",
         })
+        log_event("sync_files", direction="download", copied=copied,
+                  deleted=len(extras) if do_clean else 0)
         log(f"Выгружено из {branch}@{sha}: {copied} объектов, {tgt_files} файлов → {target_path}")
         return sha
+
+    def download_plan(self, cfg: Any, log: Callable[[str], None]) -> str:
+        """План ВЫГРУЗКИ без clone/fetch/checkout и без записи на диск (ТЗ 2.1).
+
+        Список файлов репо берём через `ls-remote`/`ls-tree` (для удалённых
+        URL — через локальную копию, если она уже есть; её НЕ изменяем).
+        """
+        repo = str(cfg.get("repository", "") or "").strip()
+        if not is_repo_url(repo):
+            raise GitError(f"«{repo}» не похоже на ссылку на репозиторий.")
+        branch = cfg.get("branch", "main") or "main"
+        nt = self.git.net_timeout(cfg)
+
+        workdir = local_clone_dir(repo)
+        repo_files: set = set()
+        sha = "?"
+        if (workdir / ".git").is_dir():
+            # существующая копия — используем для плана, не модифицируя
+            try:
+                repo_files = {ln for ln in
+                              self.git.run(["ls-files"], cwd=workdir).splitlines()
+                              if ln.strip()}
+                sha = self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir)
+            except GitError:
+                pass
+        else:
+            repo_files = self.ls_remote_files(repo, branch, nt)
+            try:
+                out = self.git.run(["ls-remote", "--", repo,
+                                    f"refs/heads/{branch}"], timeout=nt)
+                for line in out.splitlines():
+                    parts = line.split("\t")
+                    if len(parts) == 2 and parts[1].strip() == f"refs/heads/{branch}":
+                        sha = parts[0].strip()[:7]
+                        break
+            except GitError:
+                pass
+
+        target = str(cfg.get("download_folder", "") or "").strip() \
+            or str(cfg.get("source_folder", "") or "").strip()
+        if not target:
+            raise GitError("Не указана папка выгрузки («Папка выгрузки» или «Папка»).")
+        target_path = Path(target).expanduser()
+        guard_recursive_sync(None, workdir, target_path)
+
+        top_repo = {p.split("/")[0] for p in repo_files}
+        try:
+            existing = {p.name for p in target_path.iterdir()} \
+                if target_path.is_dir() else set()
+        except OSError:
+            existing = set()
+        will_copy = sorted(top_repo & existing)
+        will_add = sorted(top_repo - existing)
+        extras = sorted(n for n in existing
+                        if n not in top_repo and n not in SYNC_IGNORE
+                        and n not in PROTECT_FROM_DELETE)
+        del_line = (f"Лишних объектов будет удалено (delete_extra ВКЛЮЧЕН): "
+                    f"{len(extras)}") if cfg.get("delete_extra") else \
+                   f"Лишних объектов (не удаляются — delete_extra выключен): " \
+                   f"{len(extras)}"
+        lines = [f"РЕЖИМ DRY-RUN (только просмотр) — {branch}@{sha} → {target_path}",
+                 "",
+                 f"Будет обновлено файлов/папок: {len(will_copy)}",
+                 *(f"  ~ {n}" for n in will_copy[:100]),
+                 f"Будет добавлено: {len(will_add)}",
+                 *(f"  + {n}" for n in will_add[:100]),
+                 del_line,
+                 *(f"  - {n}" for n in extras[:100]),
+                 "",
+                 "Clone/fetch/checkout НЕ выполнялись; файлы на диске НЕ изменялись."]
+        log("DRY-RUN: выгрузка не выполнялась, диск не тронут.")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     #  Тест remote / список веток / счётчик / откат / теги                 #
@@ -1609,25 +1995,68 @@ class RepoService:
 
     def count_changes(self, cfg: Any,
                       _log: Optional[Callable[[str], None]] = None) -> int:
-        """Число изменённых файлов в рабочей копии (для кнопки КОММИТ).
+        """Счётчик изменений источник ↔ репо (ТЗ v4, задача 2.4).
 
-        _log — необязательный callable: TaskRunner передаёт его вторым
-        аргументом; сигнатура согласована с остальными фоновыми задачами.
+        Быстрый вариант (по умолчанию): сравнение содержимого source с
+        рабочей копией репозитория (diff_files) + git status worktree.
+        Точный вариант (accurate_count=True): симуляция into_repo во
+        временной папке и `git diff --stat HEAD` там же.
+        Результат кэшируется на CHANGE_COUNT_CACHE_TTL секунд.
         """
         repo = str(cfg.get("repository", "") or "").strip()
         local = local_clone_dir(repo)
         if not (local / ".git").is_dir():
             return 0
+        source = Path(str(cfg.get("source_folder", "") or "").strip())
+        key = f"{repo}|{source}"
+        cached = RepoService._count_cache.get(key)
+        now_ts = time.monotonic()
+        if cached and now_ts - cached[0] < CHANGE_COUNT_CACHE_TTL:
+            return cached[1]
+        result = 0
         try:
-            out = self.git.run(["status", "--porcelain"], cwd=local)
+            if bool(cfg.get("accurate_count")) and source.is_dir():
+                # точная симуляция: копия workdir без .git + into_repo + diff
+                with tempfile.TemporaryDirectory(prefix="gcsim_") as tmp:
+                    sim = Path(tmp) / "wd"
+                    sim.mkdir()
+                    FileSync._default_fs.copy_repo_items(local, sim)
+                    self.fs.into_repo(source, sim,
+                                      delete_extra=bool(cfg.get("delete_extra", False)))
+                    shutil.copytree(local / ".git", sim / ".git")
+                    out = self.git.run(["status", "--porcelain"], cwd=sim)
+                    result = len([ln for ln in out.splitlines() if ln.strip()])
+            else:
+                # быстрый: реальные отличия источника от worktree (diff_files)
+                diffs = 0
+                if source.is_dir():
+                    _, modified, deleted = self.fs.diff_files(source, local)
+                    diffs = len(modified) + len(deleted)
+                status_out = self.git.run(["status", "--porcelain"], cwd=local)
+                dirty = len([ln for ln in status_out.splitlines() if ln.strip()])
+                result = max(diffs, dirty) if diffs else dirty
         except GitError:
-            return 0
-        return len([ln for ln in out.splitlines() if ln.strip()])
+            result = 0
+        RepoService._count_cache[key] = (now_ts, result)
+        return result
 
-    def reset_last(self, cfg: Any, mode: str) -> str:
-        """Откат последнего локального коммита: mode='soft'|'hard'."""
+    count_changes.cache_clear = staticmethod(lambda: RepoService._count_cache.clear())
+
+    def reset_last(self, cfg: Any, mode: str, revert_source: bool = False) -> str:
+        """Откат последнего локального коммита (ТЗ v4, задача 2.6).
+
+        mode='soft'|'hard'. После отката worktree приводится в чистое
+        состояние: синхронизация источника откатывается назад (добавленные
+        файлы удаляются, изменённые восстанавливаются из HEAD; при hard —
+        ещё и checkout -f). Источник (source_folder) НЕ трогается, если
+        revert_source=True — тогда изменения из workdir возвращаются в
+        источник («откатить и в источнике», опасно).
+        """
+        if mode not in ("soft", "hard"):
+            raise GitError(f"Неизвестный режим отката: {mode!r}")
         workdir = self.ensure_layout(cfg, need_source=False)
-        branch = cfg.get("branch", "main") or "main"
+        branch = validate_branch_name(cfg.get("branch", "main") or "main",
+                                      cwd=workdir)
         try:
             ahead = int(self.git.run(["rev-list", "--count",
                                       f"origin/{branch}..HEAD"], cwd=workdir) or "0")
@@ -1638,7 +2067,33 @@ class RepoService:
                            "Используйте git revert вручную.")
         last = self.git.run(["log", "-1", "--pretty=%h %s"], cwd=workdir)
         self.git.run(["reset", f"--{mode}", "HEAD~1"], cwd=workdir)
-        return f"Откат {mode}: убрали коммит «{last}»"
+        # Приводим worktree в чистое состояние (ТЗ v4, задача 2.6):
+        # soft-rollback оставляет изменения в рабочем дереве — убираем их
+        # синхронизацией с HEAD; hard — дополнительно checkout/clean.
+        self.git.run(["reset", "--hard", "HEAD"], cwd=workdir)
+        status = self.git.run(["status", "--porcelain"], cwd=workdir)
+        if status:
+            self.git.run(["clean", "-fd", "--"], cwd=workdir)
+        note = ""
+        if revert_source:
+            source = Path(str(cfg.get("source_folder", "") or "").strip())
+            if source.is_dir():
+                n = self.fs.copy_repo_items(workdir, source)
+                note = f" Изменения возвращены в источник ({n} объектов)."
+            else:
+                note = " (источник не найден — возврат в источник пропущен)"
+        else:
+            note = (" Внимание: файлы источника не изменялись — при следующей "
+                    "синхронизации откатнутые изменения вернутся.")
+        self.append_history(cfg, {
+            "type": "revert",
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "sha": self.git.run(["rev-parse", "--short", "HEAD"], cwd=workdir),
+            "branch": branch,
+            "message": f"Откат {mode}: убрали коммит «{last}»",
+        })
+        log_event("revert_finished", mode=mode, removed=last)
+        return f"Откат {mode}: убрали коммит «{last}». Worktree чист.{note}"
 
     def tag(self, cfg: Any, name: str, annotation: str, push: bool) -> str:
         workdir = self.ensure_layout(cfg, need_source=False)
@@ -1682,6 +2137,12 @@ def make_commit_message(cfg) -> str:
 
 def porcelain_plan(workdir: Path, staged: bool = False) -> tuple:
     return _default_service.porcelain_plan(workdir, staged=staged)
+
+
+# ---- [compat] псевдонимы эпохи v1/v2 для интеграционных тестов ---------- #
+run_git_safe = run_git                     # старый алфавитный вариант имени
+ensure_layout = ensure_repo_layout         # короткое имя той же операции
+download = download_from_repo              # репозиторий → папка
 
 
 # --------------------------------------------------------------------------- #
@@ -1794,6 +2255,11 @@ class TaskRunner:
         # его не сбрасывает, иначе second start пройдёт в гонке.
         self.busy = False
         self.current_task = None
+
+    @property
+    def queue(self) -> "queue.Queue[tuple]":
+        """Очередь событий задачи (log/done/error) — только для чтения наружу."""
+        return self._queue
 
     def start(self, kind: str, fn: Callable[..., Any], *args: Any) -> bool:
         """False, если уже занято. fn вызывается как fn(log, *args)."""
@@ -1982,6 +2448,9 @@ class MainWindow:
                                    backup=BackupManager(),
                                    notifier=self.notifier)
         self.tasks = TaskRunner()
+        # Очередь событий фоновых задач (log/done/error) — доступна наружу
+        # под историческим именем msg_queue; владелец — TaskRunner.
+        self.msg_queue = self.tasks.queue
         self.scheduler = AutoScheduler(on_due=self._launch_auto,
                                        interval_getter=self._interval_minutes)
 
@@ -2430,12 +2899,17 @@ class MainWindow:
                 "и нажмите «…» ещё раз — либо вставьте её в поле вручную (Ctrl+V).")
 
     def open_config(self) -> None:
-        """Маленькая кнопка с троеточием внизу — открыть файл конфига."""
+        """Маленькая кнопка с троеточием внизу — открыть файл конфига.
+
+        Открытие делегируется модульной функции ``open_config_in_editor``
+        (её можно переопределить в тестах/скриптах), а не статическому
+        методу класса.
+        """
         self._collect_cfg()
         path = config_path()
         if not path.exists():
             self.cfg.save()
-        self._open_in_editor(path)
+        open_config_in_editor(path)
         self.set_status(f"Конфиг открыт: {path.name}")
 
     @staticmethod
@@ -3269,6 +3743,15 @@ class MainWindow:
 
 
 CommitterApp = MainWindow     # псевдоним эпохи v2
+
+
+def open_config_in_editor(path: Path) -> None:
+    """[compat] Открыть конфиг во внешнем редакторе (дефолтная реализация).
+
+    GUI подменяет эту функцию при создании окна; наружный код (тесты,
+    скрипты) может переопределить её для проверки факта вызова.
+    """
+    MainWindow._open_in_editor(Path(path))  # noqa: SLF001
 
 
 # --------------------------------------------------------------------------- #
