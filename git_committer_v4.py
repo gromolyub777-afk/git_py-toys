@@ -146,7 +146,7 @@ def _parse_dnd_paths(raw: str) -> list[str]:
             return list(root.splitlist(raw))
     except Exception:                                # noqa: BLE001
         pass
-    return [p.strip("{}") for p in re.findall(r"\{[^}]*\}|[^\s]+", raw or "")]
+    return [p.strip("{}") for p in re.findall(r"\{[^}]*\}|\S+", raw or "")]
 
 
 # v5 (ТЗ UI/UX): иконки — Unicode-эмодзи, константами, чтобы не искать по коду.
@@ -1281,6 +1281,100 @@ class FileSync:
             _log_deleted(removed, "from_repo delete_extra")
         return copied, removed, cancelled, len(extras)
 
+    # ------------------------------------------------------------------ #
+    #  FIX (ТЗ эпик 1, задача 1.2): diff_files — быстрый подсчёт отличий  #
+    #  дерева source от дерева local без копирования во временную папку.   #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _walk_tree(root: Path, ignore_patterns: Optional[list[str]] = None,
+                   base: Optional[Path] = None) -> dict:
+        """{относительный путь: 'f'|'d'} для всех объектов дерева root.
+
+        Служебные папки (SYNC_IGNORE), *.egg-info и пользовательские
+        glob-паттерны пропускаются так же, как при копировании; ошибки
+        чтения каталога не прерывают обход (ТЗ 1.4).
+        """
+        root = Path(root)
+        base = base if base is not None else root
+        patterns = ignore_patterns or []
+        out: dict = {}
+        try:
+            entries = sorted(root.iterdir())
+        except OSError as exc:
+            _log_to_file(f"Не удалось прочитать «{root}» ({exc})",
+                         logging.WARNING)
+            return out
+        for item in entries:
+            if item.name in SYNC_IGNORE or item.name.endswith(".egg-info"):
+                continue
+            if matches_sync_ignore(item.name, patterns):
+                continue
+            rel = str(item.relative_to(base))
+            try:
+                if item.is_dir():
+                    out[rel] = "d"
+                    out.update(FileSync._walk_tree(item, patterns, base))
+                elif item.is_file():
+                    out[rel] = "f"
+            except OSError:
+                continue
+        return out
+
+    @staticmethod
+    def _file_equal(a: Path, b: Path) -> bool:
+        """Файлы идентичны? Сначала размер/mtime, затем содержимое."""
+        try:
+            sa, sb = a.stat(), b.stat()
+        except OSError:
+            return False
+        if sa.st_size != sb.st_size:
+            return False
+        if sa.st_mtime_ns == sb.st_mtime_ns:
+            return True
+        try:
+            with open(a, "rb") as fa, open(b, "rb") as fb:
+                while True:
+                    ca, cb = fa.read(65536), fb.read(65536)
+                    if ca != cb:
+                        return False
+                    if not ca:
+                        return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def diff_files(source: Any, local: Any,
+                   cfg: Any = None) -> tuple:
+        """Сравнивает два дерева файлов (source ↔ локальную копию репо).
+
+        Возвращает кортеж (added, modified, deleted) списков относительных
+        путей:
+          * added    — есть в source, нет в local;
+          * modified — есть в обоих, но содержимое отличается
+                       (или сменился тип «файл ↔ папка»);
+          * deleted  — есть в local, нет в source.
+        Одинаковые по размеру файлы сравниваются по содержимому (mtime —
+        только быстрая эвристика «точно равны»). Используется в
+        RepoService.count_changes (быстрый режим подсчёта изменений).
+        """
+        source, local = Path(source), Path(local)
+        patterns = sync_ignore_patterns(cfg) if cfg is not None else None
+        src_map = FileSync._walk_tree(source, patterns) \
+            if source.is_dir() else {}
+        dst_map = FileSync._walk_tree(local, patterns) \
+            if local.is_dir() else {}
+        added = [rel for rel in sorted(src_map) if rel not in dst_map]
+        deleted = [rel for rel in sorted(dst_map) if rel not in src_map]
+        modified = []
+        for rel in sorted(set(src_map) & set(dst_map)):
+            if src_map[rel] != dst_map[rel]:
+                modified.append(rel)               # сменился тип файл↔папка
+            elif src_map[rel] == "f":
+                if not FileSync._file_equal(source / rel, local / rel):
+                    modified.append(rel)
+        return added, modified, deleted
+
     @staticmethod
     def copy_repo_items(workdir: Path, target: Path, cfg: Any = None) -> int:
         """FIX-3.6: используется только в симуляции count_changes.
@@ -1484,6 +1578,12 @@ class RepoService:
     _count_cache: dict = {}
     _count_lock: threading.Lock = threading.Lock()
 
+    # FIX (ТЗ эпик 2, задача 2.1): колбэк диалога merge-конфликтов.
+    # Раньше MainWindow динамически навешивал `service.on_conflicts`, из-за
+    # чего Pylance не находил атрибут в классе. Теперь он объявлен явно;
+    # RepoService.commit проверяет его через getattr + callable() (FIX-2.3).
+    on_conflicts: Optional[Callable[[list], str]] = None
+
     def __init__(self,
                  git: Optional[GitRunner] = None,
                  fs: Optional[FileSync] = None,
@@ -1670,6 +1770,15 @@ class RepoService:
         """
         branch = cfg.get("branch", "main") or "main"
         nt = self.git.net_timeout(cfg)
+
+        # FIX (ТЗ эпик 4, задача 4.2): безопасный разбор вывода git —
+        # пустая строка / строка с пробелами не должны ронять int().
+        def _safe_int(val: Any) -> int:
+            try:
+                return int(str(val).strip())
+            except (TypeError, ValueError):
+                return 0
+
         try:
             self.git.run(["fetch", "origin", branch], cwd=workdir, timeout=nt)
         except GitError as exc:
@@ -1682,7 +1791,7 @@ class RepoService:
                                       f"origin/{branch}..HEAD"], cwd=workdir)
         except GitError:                       # remote-ветки ещё нет
             return 0
-        behind, ahead = int(behind_txt or 0), int(ahead_txt or 0)
+        behind, ahead = _safe_int(behind_txt), _safe_int(ahead_txt)
         if behind == 0:
             return 0
         if ahead > 0:
