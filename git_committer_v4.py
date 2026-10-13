@@ -56,7 +56,6 @@ import logging
 import os
 import queue
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -69,7 +68,7 @@ from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 try:
     import tkinter as tk
@@ -3002,18 +3001,17 @@ class MainWindow:
         self.var_status.set(text)
 
     def _interval_minutes(self, mode: Optional[str] = None) -> int:
-        # Интервалы читаем с диска — ручные правки в config.json
-        # подхватываются без перезапуска приложения.
-        try:
-            probe = Config(config_path())
-            probe.load()
-            disk = probe.as_dict()
-        except Exception:                                    # noqa: BLE001
-            disk = self.cfg.as_dict()
+        """Интервал режима в минутах.
 
+        FIX-6.2: читаем из self.cfg (память), а не с диска. Правки спинбоксов
+        обновляют self.cfg сразу (_on_interval_change) — расписание
+        пересчитывается корректно, не дожидаясь debounce-записи на диск.
+        Ручные правки config.json без перезапуска приложения
+        подхватываются через self.cfg.reload() (вызывается в main при старте).
+        """
         def _val(key, default):
             try:
-                v = int(disk.get(key, default))
+                v = int(self.cfg.get(key, default))
             except (TypeError, ValueError):
                 v = default
             return v
@@ -3177,7 +3175,8 @@ class MainWindow:
         пользователь может снять его галочкой «Только показать (dry-run)».
         """
         self.var_checks["dry_run"].set(True)
-        self._on_settings_change()
+        # FIX-6.5: on_commit() сам вызывает _collect_cfg() — отдельный
+        # дебаунс только добавлял вторую запись config.json.
         self.on_commit()
 
     @staticmethod
@@ -3455,17 +3454,21 @@ class MainWindow:
             return "cancel"
         return "merge" if ans else "overwrite"
 
-    def _start_bg(self, kind: str, fn: Callable[..., Any], *args: Any) -> bool:
+    def _start_bg(self, kind: str, fn: Callable[..., Any], *args: Any,
+                  status_text: str = "Выполняется задача…") -> bool:
         """Запускает задачу в фоновом потоке. False, если уже занято.
 
         Фоновые задачи получают СНИМОК конфига (cfg.as_dict()), а не сам
         Config — иначе гонка при save().
+        FIX-6.4: status_text позволяет вызывающему задать специфичный
+        текст статуса (например, «Авто-коммит: выполняем…»), иначе
+        _set_busy_status перетирал его обобщённым.
         """
         # Фоновые задачи (кроме интерактивных commit/download) выполняются
         # молча: не трогают кнопки и статус, чтобы не мешать авто-режимам.
         quiet = kind in ("count", "branches", "test-conn")
         if not quiet:
-            self._set_busy_status("Выполняется задача…")
+            self._set_busy_status(status_text)
         cfg_snapshot = self.cfg.as_dict()
         # История пишется read-modify-write поверх файла, поэтому снимок
         # дополнительно подтягивает актуальные значения ключей с диска —
@@ -3542,14 +3545,19 @@ class MainWindow:
         self._refresh_buttons()
         if kind == "error":
             if task == "count":
-                # фоновый счётчик — молча, но помечаем к пересчёту
+                # FIX-6.7: счётчик — «тихая» задача, но причину падения
+                # фиксируем в файловом логе, иначе пользователь видит
+                # только 0 на кнопке без объяснений.
                 self._count_dirty = True
+                _log_to_file(f"Счётчик изменений: {text}", logging.WARNING)
                 return
             label = self.TASK_LABELS.get(task, task or "задача")
             self.set_status(f"Ошибка: {label}")
             self.log(str(text))
-            if interactive and task in ("commit", "download", "revert", "tag",
-                                        "test-conn"):
+            # FIX-6.1: единый кортеж _INTERACTIVE_TASKS вместо хардкода —
+            # иначе список в _is_interactive и здесь разъезжался (branches
+            # терялся в messagebox).
+            if interactive and task in self._INTERACTIVE_TASKS:
                 messagebox.showerror(APP_TITLE, str(text))
         else:
             if task == "commit":
@@ -3614,12 +3622,25 @@ class MainWindow:
             if b is not None:
                 b.configure(state=state)
 
+    def _reject_if_busy(self) -> bool:
+        """FIX-6.3: True, если задача уже идёт — и пишем в статус, какая.
+
+        Раньше клик молча игнорировался, что вводило в заблуждение: кнопки
+        остаются активными во время «тихих» задач (count/branches/test-conn),
+        но клик ничего не делал.
+        """
+        if not self.tasks.busy:
+            return False
+        label = self.TASK_LABELS.get(self.tasks.current_task or "", "задача")
+        self.set_status(f"Подождите: выполняется «{label}»…")
+        return True
+
     # ================================================================== #
     #  Прямые процессы                                                    #
     # ================================================================== #
 
     def on_commit(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         if not self.cfg.get("repository"):
@@ -3635,7 +3656,7 @@ class MainWindow:
         self._start_bg("commit", self.service.commit, False, self.on_diverged)
 
     def on_download(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         if not self.cfg.get("repository"):
@@ -3710,7 +3731,7 @@ class MainWindow:
     # ================================================================== #
 
     def on_test_connection(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         repo = str(self.cfg.get("repository", "")).strip()
@@ -3726,7 +3747,7 @@ class MainWindow:
         self._start_bg("test-conn", _test)
 
     def on_refresh_branches(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         if not is_repo_url(str(self.cfg.get("repository", "")).strip()):
@@ -3836,7 +3857,7 @@ class MainWindow:
             .pack(side="right", padx=(0, 6))
 
     def on_revert_last(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         if not is_repo_url(str(self.cfg.get("repository", "")).strip()):
@@ -3859,7 +3880,7 @@ class MainWindow:
         self._start_bg("revert", _revert)
 
     def on_create_tag(self) -> None:
-        if self.tasks.busy:
+        if self._reject_if_busy():
             return
         self._collect_cfg()
         if not is_repo_url(str(self.cfg.get("repository", "")).strip()):
@@ -3978,11 +3999,17 @@ class MainWindow:
     def _on_interval_change(self, mode) -> None:
         """Спинбоксы интервалов: общий и индивидуальные.
 
-        FIX-5.6: планирование таймеров делаем сразу (иначе индикатор
-        «следующий через…» отстаёт от спинбокса), а запись config.json —
-        через дебаунс _on_settings_change. Иначе стрелки ↑/↓ пишут
-        конфиг на каждое нажатие.
+        FIX-6.2: сначала обновляем self.cfg в памяти (без записи на диск),
+        потом перепланируем таймеры — так schedule() видит новые числа.
+        Запись на диск — через дебаунс _on_settings_change, чтобы стрелки
+        ↑/↓ не писали конфиг на каждое нажатие.
         """
+        self.cfg.set("auto_interval_min",
+                     self._clamp_interval(self.var_ai.get()))
+        self.cfg.set("auto_commit_interval_min",
+                     self._clamp_interval_or_zero(self.var_ci.get()))
+        self.cfg.set("auto_clone_interval_min",
+                     self._clamp_interval_or_zero(self.var_cl.get()))
         for m in (("commit", "download") if mode is None else (mode,)):
             if self.scheduler.is_enabled(m):
                 self.scheduler.schedule(m, enable=False)
@@ -4011,12 +4038,13 @@ class MainWindow:
         # он уже включён чекбоксом (enable=False при выключенном).
         self.scheduler.schedule(mode, enable=self.scheduler.is_enabled(mode))
         if mode == "commit":
-            self.set_status("Авто-коммит: выполняем…")
             # FIX-2.4: в авто-режиме диалог недопустим — on_diverged=None,
             # RepoService выберет "cancel".
-            return self._start_bg("auto-commit", self.service.commit, True)
-        self.set_status("Авто-клон: выполняем…")
-        return self._start_bg("auto-download", self.service.download, None)
+            # FIX-6.4: статус передаём через status_text, чтобы не перетёрся.
+            return self._start_bg("auto-commit", self.service.commit, True,
+                                  status_text="Авто-коммит: выполняем…")
+        return self._start_bg("auto-download", self.service.download, None,
+                              status_text="Авто-клон: выполняем…")
 
     def _auto_can_run(self, mode: str) -> bool:
         cfg = self.cfg
@@ -4164,8 +4192,8 @@ class MainWindow:
         self.log("Watcher: изменения файлов (30 с тишины) — авто-коммит.")
         self.scheduler.schedule("commit",
                                 enable=self.scheduler.is_enabled("commit"))
-        self.set_status("Watcher: авто-коммит…")
-        self._start_bg("auto-commit", self.service.commit, True)
+        self._start_bg("auto-commit", self.service.commit, True,
+                       status_text="Watcher: авто-коммит…")
 
     # ---- основной тик ----------------------------------------------------- #
 
